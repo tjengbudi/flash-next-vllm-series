@@ -1,0 +1,179 @@
+diff -ruN a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py	2026-10-29 09:08:17.049241535 +0700
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py	2026-10-29 09:08:17.051241532 +0700
+@@ -658,7 +658,7 @@
+     return BLOCK_N, num_warps, num_tiles, num_splits
+ 
+ 
+-@triton.jit(do_not_specialize=["num_rows", "page_lo", "pages_in_arena"])
++@triton.jit(do_not_specialize=["num_rows", "page_lo", "pages_in_arena", "bucket"])
+ def _qsa_sparse_staged_gqa_kernel(
+     q_ptr,
+     k_arena_ptr,
+@@ -689,6 +689,11 @@
+     num_rows,
+     page_lo,
+     pages_in_arena,
++    part_ptr,
++    part_start_ptr,
++    stride_part_row,
++    stride_part_start_row,
++    bucket,
+     TOPK: tl.constexpr,
+     PAGE_SIZE: tl.constexpr,
+     GROUP_SIZE: tl.constexpr,
+@@ -700,6 +705,7 @@
+     FIRST_BUCKET: tl.constexpr,
+     LAST_BUCKET: tl.constexpr,
+     IS_FP8: tl.constexpr,
++    PARTITIONED: tl.constexpr = False,
+ ) -> None:
+     local_row = tl.program_id(0)
+     kv_head = tl.program_id(1)
+@@ -736,15 +742,35 @@
+         )
+ 
+     score_scale = softmax_scale * 1.4426950408889634
+-    tile_end = tl.minimum(NUM_TILES, tl.cdiv(tl.minimum(valid_count, TOPK), BLOCK_N))
++    if PARTITIONED:
++        # local-51: this bucket's tokens are columns [seg_lo, seg_hi) of the
++        # row's partitioned list (_qsa_bucket_partition_kernel).
++        seg_lo = tl.load(part_start_ptr + local_row * stride_part_start_row + bucket)
++        seg_hi = tl.load(part_start_ptr + local_row * stride_part_start_row + bucket + 1)
++        tile_begin = seg_lo // BLOCK_N
++        tile_end = tl.cdiv(seg_hi, BLOCK_N)
++    else:
++        seg_lo = 0
++        seg_hi = TOPK
++        tile_begin = 0
++        tile_end = tl.minimum(
++            NUM_TILES, tl.cdiv(tl.minimum(valid_count, TOPK), BLOCK_N)
++        )
+ 
+-    for tile in range(0, tile_end):
++    for tile in range(tile_begin, tile_end):
+         columns = tile * BLOCK_N + column_offsets
+-        logical_token = tl.load(
+-            indices_ptr + row * stride_indices_row + columns,
+-            mask=columns < TOPK,
+-            other=-1,
+-        )
++        if PARTITIONED:
++            logical_token = tl.load(
++                part_ptr + local_row * stride_part_row + columns,
++                mask=(columns >= seg_lo) & (columns < seg_hi),
++                other=-1,
++            )
++        else:
++            logical_token = tl.load(
++                indices_ptr + row * stride_indices_row + columns,
++                mask=columns < TOPK,
++                other=-1,
++            )
+         safe_token = tl.maximum(logical_token, 0)
+         logical_page = safe_token // PAGE_SIZE
+         page_offset = safe_token % PAGE_SIZE
+@@ -828,6 +854,47 @@
+         )
+ 
+ 
++@triton.jit(do_not_specialize=["pages_per_bucket", "num_buckets"])
++def _qsa_bucket_partition_kernel(
++    indices_ptr,
++    row_map_ptr,
++    part_ptr,
++    part_start_ptr,
++    stride_indices_row,
++    stride_part_row,
++    stride_part_start_row,
++    pages_per_bucket,
++    num_buckets,
++    TOPK: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    BLOCK: tl.constexpr,
++) -> None:
++    """local-51: group one row's selected tokens by staging bucket.
++
++    Writes the row's valid tokens bucket by bucket (each bucket keeps the
++    original order) and the bucket start columns, so a bucket's kernel launch
++    walks only its own tokens instead of the whole selection.
++    """
++    local_row = tl.program_id(0)
++    row = tl.load(row_map_ptr + local_row)
++    columns = tl.arange(0, BLOCK)
++    valid_count = tl.load(indices_ptr + row * stride_indices_row + TOPK)
++    in_range = columns < tl.minimum(valid_count, TOPK)
++    token = tl.load(
++        indices_ptr + row * stride_indices_row + columns, mask=in_range, other=-1
++    )
++    valid = in_range & (token >= 0)
++    token_bucket = (tl.maximum(token, 0) // PAGE_SIZE) // pages_per_bucket
++    offset = 0
++    for b in range(0, num_buckets):
++        tl.store(part_start_ptr + local_row * stride_part_start_row + b, offset)
++        selected = valid & (token_bucket == b)
++        position = offset + tl.cumsum(selected.to(tl.int32), 0) - 1
++        tl.store(part_ptr + local_row * stride_part_row + position, token, mask=selected)
++        offset += tl.sum(selected.to(tl.int32), 0)
++    tl.store(part_start_ptr + local_row * stride_part_start_row + num_buckets, offset)
++
++
+ def qsa_staged_arena_pages(arena_bytes: int, page_bytes: int) -> int:
+     """Number of logical pages the staging arena holds (at least one)."""
+     return max(1, arena_bytes // max(page_bytes, 1))
+@@ -896,6 +963,35 @@
+         block_n, partial_warps, num_stages = tuned
+         num_tiles = triton.cdiv(selection_width, block_n)
+ 
++    import os
++
++    partitioned = num_buckets > 1 and os.environ.get(
++        "VLLM_QSA_BUCKET_PART", "0"
++    ).strip() == "1"
++    if partitioned:
++        part = torch.empty(
++            (num_rows, selection_width), dtype=torch.int32, device=q.device
++        )
++        part_start = torch.empty(
++            (num_rows, num_buckets + 1), dtype=torch.int32, device=q.device
++        )
++        _qsa_bucket_partition_kernel[(num_rows,)](
++            logical_indices,
++            rows,
++            part,
++            part_start,
++            logical_indices.stride(0),
++            part.stride(0),
++            part_start.stride(0),
++            pages_in_arena,
++            num_buckets,
++            TOPK=selection_width,
++            PAGE_SIZE=page_size,
++            BLOCK=triton.next_power_of_2(selection_width),
++            num_warps=8,
++        )
++    else:
++        part = part_start = rows
+     if num_buckets == 1:
+         acc = max_state = norm_state = q
+     else:
+@@ -950,6 +1046,11 @@
+             num_rows,
+             page_lo,
+             page_hi - page_lo,
++            part,
++            part_start,
++            part.stride(0) if partitioned else 0,
++            part_start.stride(0) if partitioned else 0,
++            bucket,
+             TOPK=selection_width,
+             PAGE_SIZE=page_size,
+             GROUP_SIZE=group_size,
+@@ -961,6 +1062,7 @@
+             FIRST_BUCKET=bucket == 0,
+             LAST_BUCKET=bucket == num_buckets - 1,
+             IS_FP8=is_fp8,
++            PARTITIONED=partitioned,
+             num_warps=partial_warps,
+             num_stages=num_stages,
+         )

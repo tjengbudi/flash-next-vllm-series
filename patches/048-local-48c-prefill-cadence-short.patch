@@ -1,0 +1,194 @@
+diff -ruN a/vllm/v1/core/sched/scheduler.py c/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py	2026-10-28 12:02:52.275112071 +0700
++++ c/vllm/v1/core/sched/scheduler.py	2026-10-28 13:01:23.939177855 +0700
+@@ -387,6 +387,21 @@
+             1, int(os.environ.get("VLLM_PREFILL_CADENCE_BURST", "1") or "1")
+         )
+         self.prefill_burst_left = 0
++        # local-48c: a held cadence also held short prompts (a new chat, or an
++        # agent turn with its prefix cached) until a long prefill finished, up
++        # to ~50 s at 250K. A request with at most VLLM_PREFILL_CADENCE_SHORT
++        # prompt tokens left to compute skips the hold, gets a share of the
++        # token budget next to a long chunk, and does not restart the
++        # interval. 0 = off (l48b).
++        self.prefill_short = max(
++            0, int(os.environ.get("VLLM_PREFILL_CADENCE_SHORT", "0") or "0")
++        )
++        if self.local_prefill_interval > 1 and self.prefill_short > 0:
++            logger.info_once(
++                "Prefill cadence: prompts with at most %d tokens left to "
++                "compute skip the hold",
++                self.prefill_short,
++            )
+         if self.local_prefill_interval > 1 and self.prefill_burst > 1:
+             logger.info_once(
+                 "Prefill cadence burst: %d consecutive prefill steps per interval",
+@@ -461,6 +476,16 @@
+         # async KV loads). Their remaining-block reservation gates async loads.
+         self._inflight_prefills: set[Request] = set()
+ 
++    def _is_short_prefill(
++        self, request: Request, num_computed_tokens: int | None = None
++    ) -> bool:
++        """local-48c: prompt left to compute fits VLLM_PREFILL_CADENCE_SHORT."""
++        if self.prefill_short <= 0 or self.local_prefill_interval <= 1:
++            return False
++        if num_computed_tokens is None:
++            num_computed_tokens = request.num_computed_tokens
++        return request.num_tokens - num_computed_tokens <= self.prefill_short
++
+     def _mamba_block_aligned_split(
+         self,
+         request: Request,
+@@ -647,6 +672,10 @@
+         # Whether a waiting request was admitted with prompt left to compute.
+         # Separate from `prefill_scheduled`, which covers only the running loop.
+         prefill_admitted = False
++        # local-48c: a long (not short) prefill chunk ran in the running loop.
++        long_prefill_scheduled = False
++        # local-48c: a short prompt was prefilled this step (running or admitted).
++        short_prefill_scheduled = False
+         # Whether any scheduled request has a synchronous connector KV load.
+         has_sync_kv_loads = False
+ 
+@@ -714,6 +743,43 @@
+                 pp_decode_cap = -(-num_decodes // pp_size)
+         pp_decodes_scheduled = 0
+ 
++        # local-48c: keep budget for the first short prompt waiting behind a
++        # long prefill, so the long chunk shrinks for a step instead of taking
++        # everything. At most a quarter: QSA host-KV prefill stages only the
++        # request with the most rows in a batch and reads the others' K/V row
++        # by row, so the long chunk must stay the largest (at half, a ~250-token
++        # prompt next to a 256-token chunk of a 200K prompt cost ~25% prefill).
++        short_reserve = 0
++        # ...and while a long chunk runs this step, a short prompt's own chunk
++        # stays within the same quarter, whichever comes first in the queue.
++        short_cap = 0
++        if (
++            self.prefill_short > 0
++            and self.local_prefill_interval > 1
++            and not defer_prefills
++            and any(
++                r.is_prefill_chunk and not self._is_short_prefill(r)
++                for r in self.running
++            )
++        ):
++            short_cap = max(1, self.max_num_scheduled_tokens // 4)
++        if (
++            self.prefill_short > 0
++            and self.local_prefill_interval > 1
++            # No reserve when no slot is free for the short prompt anyway.
++            and len(self.running) + self.num_waiting_for_streaming_input
++            < self.max_num_active_reqs
++        ):
++            for i, waiting_req in enumerate(self.waiting):
++                if i >= 4:
++                    break
++                if self._is_short_prefill(waiting_req):
++                    short_reserve = min(
++                        waiting_req.num_tokens - waiting_req.num_computed_tokens,
++                        max(1, self.max_num_scheduled_tokens // 4),
++                    )
++                    break
++
+         # First, schedule the RUNNING requests.
+         req_index = 0
+         while req_index < len(self.running) and token_budget > 0:
+@@ -750,7 +816,8 @@
+                     continue
+                 pp_decodes_scheduled += 1
+ 
+-            if defer_prefills and request.is_prefill_chunk:
++            is_short = request.is_prefill_chunk and self._is_short_prefill(request)
++            if defer_prefills and request.is_prefill_chunk and not is_short:
+                 # DP prefill balancing: defer this in-progress prefill chunk to a
+                 # cadence-aligned step; decodes still run to fill this step.
+                 req_index += 1
+@@ -777,6 +844,13 @@
+             num_new_tokens = min(
+                 num_new_tokens, token_budget, input_budget - draft_slots
+             )
++            if short_cap and is_short:
++                num_new_tokens = min(num_new_tokens, short_cap)
++            if short_reserve and request.is_prefill_chunk and not is_short:
++                num_new_tokens = min(num_new_tokens, token_budget - short_reserve)
++                if num_new_tokens <= 0:
++                    req_index += 1
++                    continue
+ 
+             # Make sure the input position does not exceed the max model len.
+             # This is necessary when using spec decoding.
+@@ -915,6 +989,8 @@
+             # Schedule the request.
+             scheduled_running_reqs.append(request)
+             prefill_scheduled |= request.is_prefill_chunk
++            long_prefill_scheduled |= request.is_prefill_chunk and not is_short
++            short_prefill_scheduled |= is_short
+             request_id = request.request_id
+             req_to_new_blocks[request_id] = new_blocks
+             num_scheduled_tokens[request_id] = num_new_tokens
+@@ -1161,9 +1237,18 @@
+                     # KVTransfer: loading remote KV, do not allocate for new work.
+                     assert num_external_computed_tokens > 0
+                     num_new_tokens = 0
+-                elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
++                elif (
++                    defer_prefills
++                    and num_computed_tokens < request.num_tokens - 1
++                    and not self._is_short_prefill(request, num_computed_tokens)
++                ):
+                     # DP prefill balancing: defer this step's local prefill
+                     # compute to a cadence-aligned step.
++                    if self.prefill_short > 0 and self.local_prefill_interval > 1:
++                        # local-48c: keep looking for a short prompt behind it;
++                        # the skipped request keeps its place in the queue.
++                        skip_request(request_queue)
++                        continue
+                     break
+                 else:
+                     request_token_budget = min(token_budget, input_budget - draft_slots)
+@@ -1217,6 +1302,9 @@
+                         break
+ 
+                     num_new_tokens = min(num_new_tokens, request_token_budget)
++                    if short_cap and self._is_short_prefill(request, num_computed_tokens):
++                        # local-48c: keep the long chunk the largest in the batch.
++                        num_new_tokens = min(num_new_tokens, short_cap)
+                     assert num_new_tokens > 0
+ 
+                     # Apply Mamba alignment before encoder caps.
+@@ -1421,7 +1509,13 @@
+                 # local-48: same predicate as the deferral gate in this loop
+                 # (`num_computed_tokens < num_tokens - 1`), so full prefix-cache
+                 # hits and remote-KV resumes do not restart the interval.
+-                prefill_admitted |= num_computed_tokens < request.num_tokens - 1
++                is_short_admit = self._is_short_prefill(request, num_computed_tokens)
++                prefill_admitted |= (
++                    num_computed_tokens < request.num_tokens - 1 and not is_short_admit
++                )
++                short_prefill_scheduled |= (
++                    num_computed_tokens < request.num_tokens - 1 and is_short_admit
++                )
+                 # Only track requests that will still be prefilling after this chunk.
+                 if num_computed_tokens + num_new_tokens < request.num_tokens:
+                     self._inflight_prefills.add(request)
+@@ -1463,14 +1557,15 @@
+         # Restart the cadence interval from any step that carried prefill,
+         # whether a new admission or a running chunk.
+         if self.local_prefill_interval > 1 and total_num_scheduled_tokens > 0:
+-            if prefill_scheduled or prefill_admitted:
++            if long_prefill_scheduled or prefill_admitted:
+                 if self.prefill_burst_left > 0:
+                     self.prefill_burst_left -= 1
+                 else:
+                     self.last_prefill_step = self.num_executed_steps
+                     self.prefill_burst_left = self.prefill_burst - 1
+-            else:
+-                # Nothing left to prefill inside the burst: end it.
++            elif not short_prefill_scheduled:
++                # Nothing left to prefill inside the burst: end it. A step that
++                # only carried short prompts (local-48c) leaves the burst as is.
+                 self.prefill_burst_left = 0
+ 
+         assert token_budget >= 0

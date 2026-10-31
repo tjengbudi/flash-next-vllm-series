@@ -1,0 +1,314 @@
+diff --git a/vllm/v1/sample/ops/topk_topp_triton.py b/vllm/v1/sample/ops/topk_topp_triton.py
+index 151f641d21..4aa837e9d7 100755
+--- a/vllm/v1/sample/ops/topk_topp_triton.py
++++ b/vllm/v1/sample/ops/topk_topp_triton.py
+@@ -206,7 +206,10 @@ def _topk_topp_kernel(
+                 k_pivots_num = tl.zeros((), dtype=tl.uint32)
+                 min_larger = float("inf")
+                 num_min_larger = tl.zeros((), dtype=tl.uint32)
+-                if num_outliers > k:
++                if num_finite_total <= k:
++                    # All finite logits survive top-k; skip the cutoff search.
++                    k_pivot = -float("inf")
++                elif num_outliers > k:
+                     max_range = max_logit
+                     min_range = outlier_pivot
+                     search_range = tl.cast(num_outliers, tl.int32)
+diff --git a/vllm/v1/sample/ops/topk_topp_triton.py b/vllm/v1/sample/ops/topk_topp_triton.py
+index 4aa837e9d7..d5849a8d67 100755
+--- a/vllm/v1/sample/ops/topk_topp_triton.py
++++ b/vllm/v1/sample/ops/topk_topp_triton.py
+@@ -1513,6 +1513,7 @@ def _topp_sb_mask_kernel(
+             cum = tl.cumsum(dmask.to(tl.int32)).to(tl.float32) + num_preceding
+             keep_dup = dmask & (cum <= numkeep)
+             keep = keep & (~dmask | keep_dup)
++            num_preceding += tl.sum(dmask.to(tl.float32))
+         tl.store(ROW + i + offs, tl.where(keep, x, MASK_VALUE), mask=mask_n)
+ 
+ 
+diff --git a/vllm/model_executor/models/diffusion_gemma.py b/vllm/model_executor/models/diffusion_gemma.py
+index 7f4f9ffba9..541ae4e2f1 100644
+--- a/vllm/model_executor/models/diffusion_gemma.py
++++ b/vllm/model_executor/models/diffusion_gemma.py
+@@ -1404,14 +1404,17 @@ class DiffusionSampler:
+         # unaffected; only the canvas exploration is constrained. Applied
+         # before canvas padding so phantom positions stay uniform.
+         if num_decode > 0:
+-            top_k, top_p = self.sampling_states.get_top_k_top_p(
++            top_k, top_p, has_topp_only_rows = self.sampling_states.get_top_k_top_p(
+                 decode_slots.repeat_interleave(
+                     valid_canvas_len, output_size=int(valid_canvas_len_np.sum())
+                 ),
+                 decode_slots_np,
++                logits.shape[-1],
+             )
+             if top_k is not None or top_p is not None:
+-                logits = apply_top_k_top_p(logits.float(), top_k, top_p)
++                logits = apply_top_k_top_p(
++                    logits.float(), top_k, top_p, has_topp_only_rows=has_topp_only_rows
++                )
+ 
+         # Where each decode request's rows start in the flat logits. Tiles
+         # below gather and pad a request to the tile's width.
+diff --git a/vllm/v1/sample/ops/topk_topp_sampler.py b/vllm/v1/sample/ops/topk_topp_sampler.py
+index 085f092341..02d62298cd 100644
+--- a/vllm/v1/sample/ops/topk_topp_sampler.py
++++ b/vllm/v1/sample/ops/topk_topp_sampler.py
+@@ -484,13 +484,23 @@ class TopKTopPSampler(nn.Module):
+ 
+ 
+ def apply_top_k_top_p(
+-    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
++    logits: torch.Tensor,
++    k: torch.Tensor | None,
++    p: torch.Tensor | None,
++    has_topp_only_rows: bool = True,
+ ) -> torch.Tensor:
++    """Apply top-k and/or top-p masking to logits.
++
++    has_topp_only_rows must be True if any row has p < 1 and
++    k >= logits.shape[-1] (no active top-k).
++    """
+     if p is None and k is None:
+         return logits
+ 
+     if HAS_TRITON:
+-        return apply_top_k_top_p_triton(logits, k, p)
++        return apply_top_k_top_p_triton(
++            logits, k, p, has_topp_only_rows=has_topp_only_rows
++        )
+ 
+     is_cpu = current_platform.is_cpu()
+     return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=is_cpu)
+diff --git a/vllm/v1/sample/ops/topk_topp_triton.py b/vllm/v1/sample/ops/topk_topp_triton.py
+index d5849a8d67..6945adc662 100755
+--- a/vllm/v1/sample/ops/topk_topp_triton.py
++++ b/vllm/v1/sample/ops/topk_topp_triton.py
+@@ -987,13 +987,19 @@ _SPLIT_MAX_BATCH = 64
+ _SPLIT_MAX_SPLITS = 32  # power of two
+ _SPLIT_FANOUT = 8
+ _SPLIT_ROUNDS = 5
++# The step kernels are latency-bound at one program per SM, so keep splitting
++# past that while slices span at least this many entries; shorter slices no
++# longer amortize each program's row stats and combine replay.
++_SPLIT_MIN_SLICE = 7168
+ 
+ _TRITON_SPLIT_CACHE: dict[torch.device, dict[str, torch.Tensor]] = {}
+ 
+ 
+-def _topp_split_count(batch_size: int, num_sm: int) -> int:
++def _topp_split_count(batch_size: int, vocab_size: int, num_sm: int) -> int:
+     splits = 1
+-    while splits < _SPLIT_MAX_SPLITS and splits * 2 * batch_size <= num_sm:
++    while splits < _SPLIT_MAX_SPLITS and (
++        splits * 2 * batch_size <= num_sm or splits * 2 * _SPLIT_MIN_SLICE <= vocab_size
++    ):
+         splits *= 2
+     return splits
+ 
+@@ -1079,7 +1085,7 @@ def _topp_split_stats(
+     num_sm: int,
+ ) -> DispatchSpec:
+     batch_size, vocab_size = logits.shape
+-    splits = _topp_split_count(batch_size, num_sm)
++    splits = _topp_split_count(batch_size, vocab_size, num_sm)
+     return (logits.shape[0] * splits,), dict(
+         K=k if k is not None else logits,
+         HAS_K=k is not None,
+@@ -1373,7 +1379,7 @@ def _topp_split_step(
+     num_sm: int,
+ ) -> DispatchSpec:
+     batch_size, vocab_size = logits.shape
+-    splits = _topp_split_count(batch_size, num_sm)
++    splits = _topp_split_count(batch_size, vocab_size, num_sm)
+     return (logits.shape[0] * splits,), dict(
+         K=k if k is not None else logits,
+         HAS_K=k is not None,
+@@ -1555,7 +1561,7 @@ def _topp_split_mask(
+     num_sm: int,
+ ) -> DispatchSpec:
+     batch_size, vocab_size = logits.shape
+-    splits = _topp_split_count(batch_size, num_sm)
++    splits = _topp_split_count(batch_size, vocab_size, num_sm)
+     return (logits.shape[0] * splits,), dict(
+         K=k if k is not None else logits,
+         HAS_K=k is not None,
+@@ -1619,6 +1625,7 @@ def apply_top_k_top_p_triton(
+     k: torch.Tensor | None,
+     p: torch.Tensor | None,
+     mask_value: float = float("-inf"),
++    has_topp_only_rows: bool = True,
+ ) -> torch.Tensor:
+     """Apply combined top-k and top-p masking using Triton.
+ 
+@@ -1633,6 +1640,9 @@ def apply_top_k_top_p_triton(
+         p: [batch_size] float32 tensor of top-p values per row (0 to 1),
+             or None to disable top-p
+         mask_value: Value for masked positions (default: -inf)
++        has_topp_only_rows: Whether any row has p < 1 and k >= vocab_size.
++            False lets small batches skip the split top-p pipeline; pass it
++            only if no such row exists, as such a row would get no top-p.
+ 
+     Returns:
+         The masked logits tensor. It may or may not be modified in-place.
+@@ -1715,7 +1725,7 @@ def apply_top_k_top_p_triton(
+         mask_value,
+         num_sm,
+     )
+-    if use_split:
++    if use_split and has_topp_only_rows:
+         _apply_topp_split(logits, k_ptr, p_ptr, mask_value, num_sm)
+ 
+     return logits
+diff --git a/vllm/v1/watermarking/gpu_sampler.py b/vllm/v1/watermarking/gpu_sampler.py
+index 776dece208..48547057fa 100644
+--- a/vllm/v1/watermarking/gpu_sampler.py
++++ b/vllm/v1/watermarking/gpu_sampler.py
+@@ -58,6 +58,7 @@ class GPUWatermarkSampler(Sampler):
+         pos: torch.Tensor,
+         top_k: torch.Tensor | None,
+         top_p: torch.Tensor | None,
++        has_topp_only_rows: bool,
+         use_fused_sampler: bool,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         enabled = self.watermarking.np[idx_mapping_np] & (
+@@ -71,10 +72,13 @@ class GPUWatermarkSampler(Sampler):
+                 pos,
+                 top_k,
+                 top_p,
++                has_topp_only_rows,
+                 use_fused_sampler,
+             )
+ 
+-        processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
++        processed_logits = apply_top_k_top_p(
++            processed_logits, top_k, top_p, has_topp_only_rows=has_topp_only_rows
++        )
+         contexts = self._get_contexts(expanded_idx_mapping)
+         repeated_contexts = None
+         if self.deduplicate_contexts != "none":
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index 7ffc5bf493..4ad56292e4 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -298,8 +298,8 @@ class Sampler:
+             seq_lens_upper_bound_np,
+             skip_top_k_top_p=True,
+         )
+-        top_k, top_p = self.sampling_states.get_top_k_top_p(
+-            expanded_idx_mapping, idx_mapping_np
++        top_k, top_p, has_topp_only_rows = self.sampling_states.get_top_k_top_p(
++            expanded_idx_mapping, idx_mapping_np, logits.shape[-1]
+         )
+         # Don't use a fused sampler if no requests use top_k/top_p, if there are
+         # any greedy requests or per-request seeds, or if post-processed
+@@ -321,6 +321,7 @@ class Sampler:
+             pos,
+             top_k,
+             top_p,
++            has_topp_only_rows,
+             use_fused_sampler,
+         )
+ 
+@@ -332,6 +333,7 @@ class Sampler:
+         pos: torch.Tensor,
+         top_k: torch.Tensor | None,
+         top_p: torch.Tensor | None,
++        has_topp_only_rows: bool,
+         use_fused_sampler: bool,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         if use_fused_sampler:
+@@ -342,7 +344,9 @@ class Sampler:
+             else:  # Use XPU sampler
+                 sampled, _ = xpu_sample(processed_logits, top_k, top_p)
+         else:
+-            processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
++            processed_logits = apply_top_k_top_p(
++                processed_logits, top_k, top_p, has_topp_only_rows=has_topp_only_rows
++            )
+             sampled = gumbel_sample(
+                 processed_logits,
+                 expanded_idx_mapping,
+diff --git a/vllm/v1/worker/gpu/sample/states.py b/vllm/v1/worker/gpu/sample/states.py
+index 47cf5de856..9e598b5a91 100644
+--- a/vllm/v1/worker/gpu/sample/states.py
++++ b/vllm/v1/worker/gpu/sample/states.py
+@@ -103,13 +103,22 @@ class SamplingStates:
+         apply_min_p(logits, expanded_idx_mapping, self.min_p.gpu)
+ 
+     def get_top_k_top_p(
+-        self, expanded_idx_mapping: torch.Tensor, idx_mapping_np: np.ndarray
+-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+-        do_top_k = np.any(self.top_k.np[idx_mapping_np] != self.vocab_size)
+-        do_top_p = np.any(self.top_p.np[idx_mapping_np] != 1.0)
++        self,
++        expanded_idx_mapping: torch.Tensor,
++        idx_mapping_np: np.ndarray,
++        vocab_size: int,
++    ) -> tuple[torch.Tensor | None, torch.Tensor | None, bool]:
++        """Returns (top_k, top_p, has_topp_only_rows)."""
++        top_k_np = self.top_k.np[idx_mapping_np]
++        top_p_np = self.top_p.np[idx_mapping_np]
++        do_top_k = np.any(top_k_np != self.vocab_size)
++        do_top_p = np.any(top_p_np != 1.0)
+         top_k = self.top_k.gpu[expanded_idx_mapping] if do_top_k else None
+         top_p = self.top_p.gpu[expanded_idx_mapping] if do_top_p else None
+-        return top_k, top_p
++        has_topp_only_rows = bool(
++            do_top_p and np.any((top_k_np >= vocab_size) & (top_p_np < 1.0))
++        )
++        return top_k, top_p, has_topp_only_rows
+ 
+     def apply_top_k_top_p(
+         self,
+@@ -117,10 +126,14 @@ class SamplingStates:
+         expanded_idx_mapping: torch.Tensor,
+         idx_mapping_np: np.ndarray,
+     ) -> torch.Tensor:
+-        top_k, top_p = self.get_top_k_top_p(expanded_idx_mapping, idx_mapping_np)
++        top_k, top_p, has_topp_only_rows = self.get_top_k_top_p(
++            expanded_idx_mapping, idx_mapping_np, logits.shape[-1]
++        )
+         if top_k is None and top_p is None:
+             return logits
+-        return apply_top_k_top_p(logits, top_k, top_p)
++        return apply_top_k_top_p(
++            logits, top_k, top_p, has_topp_only_rows=has_topp_only_rows
++        )
+ 
+     def any_greedy(self, idx_mapping_np: np.ndarray) -> bool:
+         return bool(np.any(self.temperature.np[idx_mapping_np] == 0.0))
+diff --git a/vllm/v1/sample/ops/topk_topp_triton.py b/vllm/v1/sample/ops/topk_topp_triton.py
+index 6945adc662..870aba02bf 100755
+--- a/vllm/v1/sample/ops/topk_topp_triton.py
++++ b/vllm/v1/sample/ops/topk_topp_triton.py
+@@ -1480,8 +1480,6 @@ def _topp_sb_mask_kernel(
+         return
+     if fin < 0.0:
+         fin = best_fin
+-    logZ = tl.log(Z)
+-    pivot_logit = tl.log(pivot) + logZ + M
+     # numdup/numkeep are exact small integers held in fp32.
+     ties = numkeep < numdup
+     num_preceding = 0.0
+@@ -1507,15 +1505,12 @@ def _topp_sb_mask_kernel(
+     for i in range(start, end, BLOCK):
+         mask_n = i + offs < end
+         x = tl.load(ROW + i + offs, mask=mask_n, other=-float("inf"))
+-        keep = x > pivot_logit
++        # Mask in probability space (bitwise the step kernels' predicate);
++        # the logit-space pivot rounds to M for huge |M|.
++        prob = tl.exp(x - M) / Z
++        keep = (prob > pivot) | (x == M)
+         if ties:
+-            # Match the boundary value in probability space with exact
+-            # equality: `dup` is a probability computed by the step kernels
+-            # as exp(x - M) / Z, so recomputing it here with the same ops
+-            # reproduces it bitwise on any platform. (The log/exp round-trip
+-            # to logit space loses ~1e-6 to cancellation, breaking any
+-            # absolute tolerance.)
+-            dmask = tl.exp(x - M) / Z == dup
++            dmask = prob == dup
+             cum = tl.cumsum(dmask.to(tl.int32)).to(tl.float32) + num_preceding
+             keep_dup = dmask & (cum <= numkeep)
+             keep = keep & (~dmask | keep_dup)

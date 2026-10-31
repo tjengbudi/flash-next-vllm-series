@@ -1,0 +1,23 @@
+diff -ruN a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py	2026-10-23 08:57:42.000000000 +0700
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py	2026-10-23 09:54:29.368666219 +0700
+@@ -233,6 +233,10 @@
+ # deterministic. Graph-capturable (no host sync). VLLM_MARLIN_MOE_DET_ALIGN=0
+ # restores the upstream order.
+ _DET_ALIGN = os.environ.get("VLLM_MARLIN_MOE_DET_ALIGN", "1") != "0"
++# local-21d: only reorder calls with at least this many token rows. Decode steps
++# (<= max_num_seqs * (1 + num_spec) = 9 rows here) skip the extra sort kernels,
++# which cost ~5-7% at 2-3 streams; prefill chunks stay deterministic.
++_DET_ALIGN_MIN_TOKENS = int(os.environ.get("VLLM_MARLIN_MOE_DET_ALIGN_MIN_TOKENS", "10"))
+ 
+ 
+ def _deterministic_expert_order(
+@@ -395,7 +399,7 @@
+         expert_map,
+         ignore_invalid_experts=True,
+     )
+-    if _DET_ALIGN:
++    if _DET_ALIGN and hidden_states.size(0) >= _DET_ALIGN_MIN_TOKENS:
+         sorted_token_ids = _deterministic_expert_order(
+             sorted_token_ids, expert_ids, num_tokens_post_padded, block_size_m
+         )

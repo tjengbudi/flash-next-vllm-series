@@ -1,0 +1,277 @@
+diff -ru a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+--- a/vllm/v1/worker/gpu/model_runner.py	2026-10-23 13:07:27.505114207 +0700
++++ b/vllm/v1/worker/gpu/model_runner.py	2026-10-23 13:08:32.262049963 +0700
+@@ -1089,6 +1089,18 @@
+                             self.kv_cache_config,
+                             self.cudagraph_manager,
+                         )
++                    # local-30 (VLLM_CG_DRAFT_META=1): the same for the
++                    # drafter's per-step metadata builds.
++                    record_draft = getattr(
++                        self.speculator, "record_draft_attn_metadata", None
++                    )
++                    if (
++                        record_draft is not None
++                        and not profile_only
++                        and self.pcp_manager is None
++                    ):
++                        with use_workspace_lane(self._draft_workspace_lane):
++                            record_draft()
+ 
+             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+ 
+diff -ru a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+--- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py	2026-10-23 13:07:27.509114203 +0700
++++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py	2026-10-23 13:08:32.234049991 +0700
+@@ -1,7 +1,11 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
++import sys
++import warnings
+ from typing import Any
+ 
++import numpy as np
+ import torch
+ import torch.nn as nn
+ 
+@@ -25,6 +29,45 @@
+ 
+ logger = init_logger(__name__)
+ 
++# local-30: a FULL draft decode step replays a CUDA graph of its attention
++# metadata build (slot mappings + the draft groups' builders), recorded once per
++# batch shape at the end of CUDA graph capture, instead of rebuilding it in
++# Python. The FULL decode graph reads only the persistent buffers that build
++# writes; the returned metadata is not used. Off unless VLLM_CG_DRAFT_META=1,
++# which leaves the l24e/l29 code path untouched.
++_CG_DRAFT_META = os.environ.get("VLLM_CG_DRAFT_META", "0") == "1"
++
++
++class _RefuseH2D:
++    """While recording, fail every ``async_tensor_h2d``: its memcpy node would
++    re-send the recording-time host bytes on each replay. That shape keeps the
++    eager build instead."""
++
++    def __enter__(self) -> "_RefuseH2D":
++        from vllm.utils import torch_utils
++
++        orig = torch_utils.async_tensor_h2d
++
++        def refuse(*args, **kwargs):
++            raise RuntimeError("local-30: host-to-device copy in a draft metadata build")
++
++        self.orig = orig
++        self.patched = []
++        for name, mod in list(sys.modules.items()):
++            if (
++                name.startswith("vllm")
++                and mod is not None
++                and getattr(mod, "async_tensor_h2d", None) is orig
++            ):
++                mod.async_tensor_h2d = refuse
++                self.patched.append(mod)
++        return self
++
++    def __exit__(self, *exc) -> None:
++        for mod in self.patched:
++            mod.async_tensor_h2d = self.orig
++        self.patched.clear()
++
+ 
+ class AutoRegressiveSpeculator(DraftModelSpeculator):
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+@@ -47,6 +90,16 @@
+         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
+         self.use_fused_multi_step_decode = False
+ 
++        # local-30 (VLLM_CG_DRAFT_META=1): recorded draft-step metadata builds,
++        # by (num_reqs, decode batch descriptor, draft step).
++        self._cgd_graphs: dict[
++            tuple[int, BatchExecutionDescriptor, int],
++            tuple[torch.cuda.CUDAGraph, Any],
++        ] = {}
++        self._cgd_pool = None
++        self._cgd_hits = 0
++        self._cgd_misses = 0
++
+     def load_model(self, target_model: nn.Module) -> None:
+         super().load_model(target_model)
+         if not self.supports_mm_inputs:
+@@ -515,7 +568,11 @@
+         for step in range(1, self.num_speculative_steps):
+             # Rebuild every step when positions advance, or just once
+             # on the first step when positions are constant (Gemma4 MTP).
+-            if not skip_attn and (self.advance_draft_positions or step == 1):
++            if (
++                not skip_attn
++                and (self.advance_draft_positions or step == 1)
++                and not self._cgd_replay(num_reqs, batch_desc, step)
++            ):
+                 slot_mappings = self.block_tables.compute_slot_mappings(
+                     idx_mapping,
+                     query_start_loc,
+@@ -562,7 +619,7 @@
+ 
+         attn_metadata = None
+         slot_mappings_by_layer = None
+-        if not skip_attn:
++        if not skip_attn and not self._cgd_replay(num_reqs, batch_desc, 1):
+             slot_mappings = self.block_tables.compute_slot_mappings(
+                 idx_mapping,
+                 query_start_loc,
+@@ -595,6 +652,154 @@
+             batch_desc.cg_mode,
+         )
+ 
++    def _cgd_replay(
++        self, num_reqs: int, batch_desc: BatchExecutionDescriptor, step: int
++    ) -> bool:
++        """local-30: replay the recorded metadata build of a FULL draft decode
++        step. False (build eagerly) for any step without a recording."""
++        if not self._cgd_graphs or batch_desc.cg_mode != CUDAGraphMode.FULL:
++            return False
++        entry = self._cgd_graphs.get((num_reqs, batch_desc, step))
++        if entry is None:
++            self._cgd_misses += 1
++            return False
++        entry[0].replay()
++        self._cgd_hits += 1
++        if (self._cgd_hits & 0x3FFF) == 0:
++            logger.info(
++                "local-30: draft metadata replays %d, eager FULL builds %d",
++                self._cgd_hits,
++                self._cgd_misses,
++            )
++        return True
++
++    def _cgd_supported(self) -> bool:
++        from vllm.platforms import current_platform
++
++        cls = type(self)
++        return (
++            current_platform.is_cuda()
++            and self.num_speculative_steps > 1
++            and self.advance_draft_positions
++            and self.pcp_manager is None
++            and self.dcp_size == 1
++            and self.dp_size == 1
++            and self.decode_cudagraph_manager is not None
++            # Only the decode loops of this class call _cgd_replay.
++            and cls.propose is AutoRegressiveSpeculator.propose
++            and cls._multi_step_decode is AutoRegressiveSpeculator._multi_step_decode
++            and cls._fused_multi_step_decode
++            is AutoRegressiveSpeculator._fused_multi_step_decode
++        )
++
++    def _cgd_eager_build(
++        self,
++        num_reqs: int,
++        batch_desc: BatchExecutionDescriptor,
++        seq_lens_cpu_upper_bound: torch.Tensor,
++        step: int,
++    ) -> Any:
++        """The GPU-visible part of a draft decode step's metadata build, as the
++        decode loops run it for a FULL graph."""
++        self.block_tables.compute_slot_mappings(
++            self.idx_mapping[:num_reqs],
++            self.input_buffers.query_start_loc[: num_reqs + 1],
++            self.input_buffers.positions[:num_reqs],
++            batch_desc.num_tokens,
++        )
++        return self._build_uniform_attn_metadata(
++            num_reqs=num_reqs,
++            batch_desc=batch_desc,
++            num_query_per_req=1,
++            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
++            step=step,
++        )
++
++    def record_draft_attn_metadata(self) -> None:
++        """local-30: record the draft-step metadata build of every FULL draft
++        decode shape. Called once the CUDA graphs are captured."""
++        self._cgd_graphs.clear()
++        if not _CG_DRAFT_META:
++            return
++        if not self._cgd_supported():
++            logger.warning(
++                "local-30: VLLM_CG_DRAFT_META=1 ignored for this config (needs "
++                "CUDA, num_speculative_tokens > 1, an autoregressive drafter that "
++                "advances positions, no DP/DCP/PCP)"
++            )
++            return
++        keys: list[tuple[int, BatchExecutionDescriptor, int]] = []
++        steps = (
++            [1]
++            if self.use_fused_multi_step_decode
++            else list(range(1, self.num_speculative_steps))
++        )
++        for n in range(1, self.max_num_reqs + 1):
++            desc, _ = dispatch_cg_and_sync_dp(
++                self.decode_cudagraph_manager,
++                n,
++                n,
++                uniform_token_count=1,
++                dp_size=self.dp_size,
++                dp_rank=self.dp_rank,
++            )
++            if desc.cg_mode != CUDAGraphMode.FULL or desc.num_ubatches != 1:
++                continue
++            keys.extend((n, desc, step) for step in steps)
++        if not keys:
++            logger.warning("local-30: no FULL draft decode shapes to record")
++            return
++        if self._cgd_pool is None:
++            self._cgd_pool = torch.cuda.graph_pool_handle()
++        for key in keys:
++            try:
++                self._cgd_record_one(key)
++            except Exception as e:  # keep serving with the eager build
++                self._cgd_graphs.pop(key, None)
++                logger.warning(
++                    "local-30: recording draft metadata build %s failed: %r",
++                    (key[0], key[1].num_tokens, key[2]),
++                    e,
++                )
++        # Leave the request buffers as capture leaves them.
++        self.idx_mapping.zero_()
++        torch.accelerator.synchronize()
++        logger.info(
++            "local-30: recorded draft metadata builds for (num_reqs, "
++            "num_tokens, step) %s",
++            sorted((k[0], k[1].num_tokens, k[2]) for k in self._cgd_graphs),
++        )
++
++    def _cgd_record_one(self, key: tuple[int, BatchExecutionDescriptor, int]) -> None:
++        n, desc, step = key
++        n_pad = desc.num_reqs or n
++        # In-bounds dummy inputs for the warm-up build; the recording itself
++        # reads whatever the persistent buffers hold at replay time.
++        self.idx_mapping[:n].zero_()
++        self.idx_mapping[n:].fill_(-1)
++        qsl = np.minimum(np.arange(n_pad + 1, dtype=np.int32), n)
++        self.input_buffers.query_start_loc[: n_pad + 1].copy_(torch.from_numpy(qsl))
++        self.input_buffers.seq_lens[:n].fill_(1)
++        self.input_buffers.seq_lens[n:n_pad].zero_()
++        self.input_buffers.positions[:n_pad].zero_()
++        self.block_tables.get_dummy_block_tables(n_pad)
++        seq_lens_cpu_upper_bound = torch.ones(n, dtype=torch.int32)
++
++        def build() -> Any:
++            return self._cgd_eager_build(n, desc, seq_lens_cpu_upper_bound, step)
++
++        build()  # lazy allocations and kernel compiles stay outside the graph
++        torch.accelerator.synchronize()
++        graph = torch.cuda.CUDAGraph()
++        with (
++            _RefuseH2D(),
++            torch.cuda.graph(graph, pool=self._cgd_pool),
++            warnings.catch_warnings(),
++        ):
++            warnings.filterwarnings("ignore", message="The CUDA Graph is empty")
++            attn_metadata = build()
++        self._cgd_graphs[key] = (graph, attn_metadata)
++
+     def _generate_fused_drafts(
+         self,
+         num_reqs: int,

@@ -1,0 +1,727 @@
+If you would like to merge this patch upstream, I would appreciate it if you could keep me credited as the commit author, or add the following trailer to the commit message: 
+
+Co-authored-by: Minachist <84688797+aiueonicked@users.noreply.github.com>
+
+Qwen3.8-Flash-Next decode patch 07: cache host K/V rows in the staging arena.
+
+Port note (budi, 2026-09-26): for vLLM 0.30.0 the row-cache kernel applies the
+fused output gate like _qsa_sparse_paged_gqa_splitk_kernel, and the split-K
+merge launch passes the output_gate pointer and strides that 0.30.0 added to
+_qsa_merge_splitk_kernel. With the 0.29 argument list the first split-K decode
+step raised TypeError. Output stays bit-identical to qsa_sparse_paged_attention.
+
+vllm/models/qwen4_exp/nvidia/qsa.py
+vllm/models/qwen4_exp/nvidia/ops/qsa.py
+
+With VLLM_QSA_KV_OFFLOAD=1 each decode step reads the rows its QSA indexer
+selected, up to 2048 per layer (4 MiB), from host memory over PCIe. The read
+cannot start before that layer's indexer has run, so it does not overlap with
+other work: ~2 ms of a ~12 ms step once the context passes 2,048 tokens.
+Consecutive steps select mostly the same rows.
+
+The prefill staging arena (96 MiB per GPU) is idle between prefills. Decode
+batches of up to 12 rows now keep the rows they read in it, one direct-mapped
+region per QSA layer keyed by the physical cache slot, and read the hits from
+there. A K/V write drops the row it replaces, and a staged prefill drops them
+all. A hit reads the same bytes as the host copy, so the attention output is
+bit-identical. Apart from ~0.4 MiB of tags per GPU it uses no memory.
+
+On 3 x RTX 3090, 86-97% of the rows hit. Single-stream median inter-token
+latency at 8k-160k context goes from 12.1-12.5 to 10.3-10.9 ms, and four
+streams at 8k go from 16.8 to 14.9 ms.
+
+Set VLLM_QSA_ROW_CACHE=0 to read every row from host memory again. It needs a
+staging arena, so VLLM_QSA_KVO_ARENA=0 turns it off too.
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index 44a0a90..c215fc2 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -1364,9 +1364,575 @@ def qsa_compress_groups_with_ratio(
+     return pooled, first_positions
+ 
+ 
++# Decode-time cache of host K/V rows in the staging arena.
++#
++# With VLLM_QSA_KV_OFFLOAD=1 every decode step reads the up to 2048 rows its
++# indexer selected from host memory, 4 MiB per QSA layer over PCIe. The read
++# cannot start before the layer's indexer has run, so it does not overlap with
++# other work: ~2 ms of a ~12 ms step at long context on 3 x RTX 3090.
++# Consecutive steps select mostly the same rows.
++#
++# The staging arena is only used inside a prefill forward, so between
++# prefills its VRAM is free. It is split into one direct-mapped region per QSA
++# layer on the rank. A region slot holds one token's K/V row for every KV head
++# and is keyed by the physical cache slot (block * block_size + offset), so
++# requests that share prefix blocks share rows.
++#
++# Per layer and step:
++#   1. _qsa_row_cache_invalidate_kernel drops the rows whose host copy was just
++#      written and bumps the rank's epoch.
++#   2. _qsa_row_cache_plan_kernel marks every region slot one of this step's
++#      columns hits (hitmark = epoch) and lets the missing columns bid for
++#      their slot (claim = max(epoch << 32 | cache slot)).
++#   3. _qsa_sparse_paged_gqa_cached_kernel reads hits from the region and
++#      misses from host memory. A miss whose bid won a slot that no column
++#      hit writes its row and tag there. A slot with a hit is never written in
++#      the same step, and the tag of a slot being written is never used, so a
++#      row is never read while it changes.
++# Any staged prefill overwrites the arena, and all tags are dropped after it.
++# Hits read the same bytes the host holds, so the attention output is
++# bit-identical to qsa_sparse_paged_attention.
++
++
++@triton.jit
++def _qsa_row_cache_hash(slot, NUM_SLOTS: tl.constexpr):
++    mixed = (slot.to(tl.int64) * 2654435761) & 0xFFFFFFFF
++    return (mixed % NUM_SLOTS).to(tl.int32)
++
++
++@triton.jit(do_not_specialize=["num_slots_written"])
++def _qsa_row_cache_invalidate_kernel(
++    slot_mapping_ptr,
++    tag_ptr,
++    epoch_ptr,
++    num_slots_written,
++    NUM_SLOTS: tl.constexpr,
++    BLOCK: tl.constexpr,
++) -> None:
++    if tl.program_id(0) == 0:
++        tl.atomic_add(epoch_ptr, 1)
++    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    written = tl.load(
++        slot_mapping_ptr + offsets, mask=offsets < num_slots_written, other=-1
++    )
++    region_slot = _qsa_row_cache_hash(tl.maximum(written, 0), NUM_SLOTS)
++    tag = tl.load(tag_ptr + region_slot, mask=written >= 0, other=-1)
++    tl.store(tag_ptr + region_slot, -1, mask=(written >= 0) & (tag == written))
++
++
++@triton.jit
++def _qsa_row_cache_columns(
++    indices_ptr,
++    block_table_ptr,
++    row,
++    request,
++    columns,
++    stride_indices_row,
++    stride_table_req,
++    num_cache_blocks,
++    num_requests,
++    TOPK: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    PAGE_TABLE_WIDTH: tl.constexpr,
++):
++    """Same validity rules and page lookup as the split-K kernel."""
++    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
++    logical_token = tl.load(
++        indices_ptr + row * stride_indices_row + columns,
++        mask=columns < TOPK,
++        other=-1,
++    )
++    safe_token = tl.maximum(logical_token, 0)
++    logical_page = safe_token // PAGE_SIZE
++    page_offset = safe_token % PAGE_SIZE
++    valid = (
++        (request >= 0)
++        & (request < num_requests)
++        & (logical_token >= 0)
++        & (logical_page < PAGE_TABLE_WIDTH)
++    )
++    physical_page = tl.load(
++        block_table_ptr
++        + safe_request * stride_table_req
++        + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
++        mask=valid,
++        other=-1,
++    )
++    valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
++    safe_page = tl.maximum(physical_page, 0).to(tl.int64)
++    return valid, safe_page, page_offset
++
++
++@triton.jit(do_not_specialize=["num_requests"])
++def _qsa_row_cache_plan_kernel(
++    indices_ptr,
++    block_table_ptr,
++    token_to_req_ptr,
++    tag_ptr,
++    claim_ptr,
++    hitmark_ptr,
++    epoch_ptr,
++    stride_indices_row,
++    stride_table_req,
++    num_cache_blocks,
++    num_requests,
++    TOPK: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    PAGE_TABLE_WIDTH: tl.constexpr,
++    NUM_SLOTS: tl.constexpr,
++    BLOCK: tl.constexpr,
++) -> None:
++    row = tl.program_id(0)
++    valid_count = tl.load(indices_ptr + row * stride_indices_row + TOPK)
++    request = tl.load(token_to_req_ptr + row)
++    columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    valid, safe_page, page_offset = _qsa_row_cache_columns(
++        indices_ptr, block_table_ptr, row, request, columns,
++        stride_indices_row, stride_table_req, num_cache_blocks, num_requests,
++        TOPK, PAGE_SIZE, PAGE_TABLE_WIDTH,
++    )
++    # The attention kernel can also load columns between the count and the
++    # end of its last tile. Without a plan they miss and are not written back.
++    valid &= columns < valid_count
++    cache_slot = safe_page * PAGE_SIZE + page_offset
++    region_slot = _qsa_row_cache_hash(cache_slot, NUM_SLOTS)
++    epoch = tl.load(epoch_ptr)
++    tag = tl.load(tag_ptr + region_slot, mask=valid, other=-1)
++    hit = valid & (tag == cache_slot)
++    tl.store(
++        hitmark_ptr + region_slot, tl.full((BLOCK,), 0, tl.int64) + epoch, mask=hit
++    )
++    tl.atomic_max(
++        claim_ptr + region_slot, (epoch << 32) | cache_slot, mask=valid & ~hit
++    )
++
++
++@triton.jit(do_not_specialize=["num_rows", "num_requests"])
++def _qsa_sparse_paged_gqa_cached_kernel(
++    q_ptr,
++    k_cache_ptr,
++    v_cache_ptr,
++    indices_ptr,
++    block_table_ptr,
++    token_to_req_ptr,
++    partial_output_ptr,
++    partial_lse_ptr,
++    output_ptr,
++    output_gate_ptr,
++    region_ptr,
++    tag_ptr,
++    claim_ptr,
++    hitmark_ptr,
++    epoch_ptr,
++    stride_q_row,
++    stride_q_head,
++    stride_k_block,
++    stride_k_token,
++    stride_k_head,
++    stride_v_block,
++    stride_v_token,
++    stride_v_head,
++    stride_indices_row,
++    stride_table_req,
++    stride_output_row,
++    stride_output_head,
++    stride_output_gate_row,
++    stride_output_gate_head,
++    num_rows,
++    num_cache_blocks,
++    num_requests,
++    TOPK: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    PAGE_TABLE_WIDTH: tl.constexpr,
++    GROUP_SIZE: tl.constexpr,
++    HEAD_DIM: tl.constexpr,
++    NUM_KV_HEADS: tl.constexpr,
++    NUM_QUERY_HEADS: tl.constexpr,
++    NUM_SLOTS: tl.constexpr,
++    NUM_SPLITS: tl.constexpr,
++    NUM_TILES: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++) -> None:
++    """_qsa_sparse_paged_gqa_splitk_kernel with the row cache in front of K/V."""
++    row = tl.program_id(0)
++    kv_head = tl.program_id(1)
++    split_id = tl.program_id(2)
++    request = tl.load(token_to_req_ptr + row)
++    valid_count = tl.load(indices_ptr + row * stride_indices_row + TOPK)
++    epoch = tl.load(epoch_ptr)
++
++    head_offsets = tl.arange(0, BLOCK_M)
++    dim_offsets = tl.arange(0, HEAD_DIM)
++    column_offsets = tl.arange(0, BLOCK_N)
++    first_head = kv_head * GROUP_SIZE
++    query = tl.load(
++        q_ptr
++        + row * stride_q_row
++        + (first_head + head_offsets[:, None]) * stride_q_head
++        + dim_offsets[None, :],
++        mask=head_offsets[:, None] < GROUP_SIZE,
++        other=0.0,
++    )
++
++    max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
++    normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
++    accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
++    softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
++
++    tile_end = tl.minimum(NUM_TILES, tl.cdiv(tl.minimum(valid_count, TOPK), BLOCK_N))
++
++    for tile in range(split_id, tile_end, NUM_SPLITS):
++        columns = tile * BLOCK_N + column_offsets
++        valid, safe_page, page_offset = _qsa_row_cache_columns(
++            indices_ptr, block_table_ptr, row, request, columns,
++            stride_indices_row, stride_table_req, num_cache_blocks, num_requests,
++            TOPK, PAGE_SIZE, PAGE_TABLE_WIDTH,
++        )
++        cache_slot = safe_page * PAGE_SIZE + page_offset
++        region_slot = _qsa_row_cache_hash(cache_slot, NUM_SLOTS)
++        # A slot some column hit this step is not written this step, so its
++        # tag is stable. Any other slot's tag may be changing and is ignored.
++        hitmark = tl.load(hitmark_ptr + region_slot, mask=valid, other=0)
++        tag = tl.load(tag_ptr + region_slot, mask=valid, other=-1)
++        claim = tl.load(claim_ptr + region_slot, mask=valid, other=0)
++        stable = valid & (hitmark == epoch)
++        hit = stable & (tag == cache_slot)
++        miss = valid & ~hit
++        owner = miss & ~stable & (claim == ((epoch << 32) | cache_slot))
++        entry = region_slot.to(tl.int64) * NUM_KV_HEADS + kv_head
++        row_ptr = region_ptr + entry * (2 * HEAD_DIM)
++
++        # Host and region addresses share the UVA space, so one load serves
++        # both and the tile needs no more shared memory than the direct path.
++        keys = tl.load(
++            tl.where(
++                hit[None, :],
++                row_ptr[None, :] + dim_offsets[:, None],
++                k_cache_ptr
++                + safe_page[None, :] * stride_k_block
++                + page_offset[None, :] * stride_k_token
++                + kv_head * stride_k_head
++                + dim_offsets[:, None],
++            ),
++            mask=valid[None, :],
++            other=0.0,
++        )
++        values = tl.load(
++            tl.where(
++                hit[:, None],
++                row_ptr[:, None] + HEAD_DIM + dim_offsets[None, :],
++                v_cache_ptr
++                + safe_page[:, None] * stride_v_block
++                + page_offset[:, None] * stride_v_token
++                + kv_head * stride_v_head
++                + dim_offsets[None, :],
++            ),
++            mask=valid[:, None],
++            other=0.0,
++        )
++        tl.store(row_ptr[None, :] + dim_offsets[:, None], keys, mask=owner[None, :])
++        tl.store(
++            row_ptr[:, None] + HEAD_DIM + dim_offsets[None, :],
++            values,
++            mask=owner[:, None],
++        )
++        tl.store(
++            tag_ptr + region_slot,
++            cache_slot.to(tl.int32),
++            mask=owner & (kv_head == 0),
++        )
++
++        scores = tl.dot(query, keys)
++        scores *= softmax_scale_log2
++        scores = tl.where(valid[None, :], scores, -1.0e20)
++        next_max = tl.maximum(max_value, tl.max(scores, axis=1))
++        alpha = tl.math.exp2(max_value - next_max)
++        probabilities = tl.where(
++            valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
++        )
++        accumulator = tl.dot(
++            probabilities.to(values.dtype),
++            values,
++            acc=accumulator * alpha[:, None],
++        )
++        normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
++        max_value = next_max
++
++    has_values = normalizer > 0
++    normalized_output = tl.where(
++        has_values[:, None],
++        accumulator / tl.maximum(normalizer[:, None], 1.0e-20),
++        0.0,
++    )
++    output_mask = head_offsets[:, None] < GROUP_SIZE
++    if NUM_SPLITS == 1:
++        # Same gate epilogue as _qsa_sparse_paged_gqa_splitk_kernel.
++        normalized_output = normalized_output.to(output_ptr.dtype.element_ty)
++        output_gate = tl.load(
++            output_gate_ptr
++            + row * stride_output_gate_row
++            + (first_head + head_offsets[:, None]) * stride_output_gate_head
++            + dim_offsets[None, :],
++            mask=output_mask,
++            other=0.0,
++        ).to(tl.float32)
++        normalized_output = normalized_output.to(tl.float32) * tl.sigmoid(output_gate)
++        tl.store(
++            output_ptr
++            + row * stride_output_row
++            + (first_head + head_offsets[:, None]) * stride_output_head
++            + dim_offsets[None, :],
++            normalized_output,
++            mask=output_mask,
++        )
++    else:
++        partial_lse = tl.where(
++            has_values,
++            max_value + tl.math.log2(tl.maximum(normalizer, 1.0e-20)),
++            -float("inf"),
++        )
++        partial_row = (split_id * num_rows + row).to(tl.int64)
++        tl.store(
++            partial_output_ptr
++            + (partial_row * NUM_QUERY_HEADS + first_head + head_offsets[:, None])
++            * HEAD_DIM
++            + dim_offsets[None, :],
++            normalized_output,
++            mask=output_mask,
++        )
++        tl.store(
++            partial_lse_ptr + partial_row * NUM_QUERY_HEADS + first_head + head_offsets,
++            partial_lse,
++            mask=head_offsets < GROUP_SIZE,
++        )
++
++
++class QSARowCache:
++    """The staging arena reused as a per-layer K/V row cache between prefills.
++
++    Holds no memory of its own apart from the tags (4 B per slot and layer) and
++    two per-slot bid arrays shared by the layers of the rank.
++    """
++
++    _PLAN_BLOCK = 256
++    _INVALIDATE_BLOCK = 256
++
++    def __init__(self, arena: torch.Tensor, num_layers: int):
++        pages, num_kv_heads, page_size, row_width = arena.shape
++        self.num_layers = num_layers
++        self.num_kv_heads = num_kv_heads
++        self.num_slots = pages * page_size // num_layers
++        self.rows = arena.view(-1, row_width)
++        self.tags = torch.full(
++            (num_layers, self.num_slots), -1, dtype=torch.int32, device=arena.device
++        )
++        self.claim = torch.zeros(self.num_slots, dtype=torch.int64, device=arena.device)
++        self.hitmark = torch.zeros_like(self.claim)
++        self.epoch = torch.zeros(1, dtype=torch.int64, device=arena.device)
++        self._layers: dict[str, int] = {}
++
++    def add_layer(self, layer_name: str) -> int | None:
++        if layer_name not in self._layers:
++            if len(self._layers) >= self.num_layers:
++                return None
++            self._layers[layer_name] = len(self._layers)
++        return self._layers[layer_name]
++
++    def region(self, layer_index: int) -> torch.Tensor:
++        size = self.num_slots * self.num_kv_heads
++        return self.rows[layer_index * size : (layer_index + 1) * size]
++
++    def invalidate_all(self) -> None:
++        self.tags.fill_(-1)
++
++    def invalidate(self, layer_index: int, slot_mapping: torch.Tensor) -> None:
++        count = slot_mapping.shape[0]
++        _qsa_row_cache_invalidate_kernel[
++            (max(1, triton.cdiv(count, self._INVALIDATE_BLOCK)),)
++        ](
++            slot_mapping,
++            self.tags[layer_index],
++            self.epoch,
++            count,
++            NUM_SLOTS=self.num_slots,
++            BLOCK=self._INVALIDATE_BLOCK,
++            num_warps=4,
++        )
++
++
++_QSA_ROW_CACHES: dict[int, QSARowCache] = {}
++# Below this many rows per layer (two selections' worth) the cache would
++# mostly evict itself.
++_QSA_ROW_CACHE_MIN_SLOTS = 4096
++
++
++def qsa_get_row_cache(
++    arena: torch.Tensor, num_layers: int
++) -> QSARowCache | None:
++    """Return the row cache that lives in ``arena`` (one per rank).
++
++    None if the arena holds fewer than _QSA_ROW_CACHE_MIN_SLOTS rows per layer.
++    """
++    rows = arena.shape[0] * arena.shape[2]
++    if num_layers < 1 or rows // num_layers < _QSA_ROW_CACHE_MIN_SLOTS:
++        return None
++    key = arena.data_ptr()
++    cache = _QSA_ROW_CACHES.get(key)
++    if cache is None:
++        cache = QSARowCache(arena, num_layers)
++        _QSA_ROW_CACHES[key] = cache
++        from vllm.logger import init_logger
++
++        init_logger(__name__).info(
++            "QSA row cache: %d rows per layer for %d layers in the %.0f MiB "
++            "staging arena on %s",
++            cache.num_slots, num_layers,
++            arena.numel() * arena.element_size() / 2**20, arena.device,
++        )
++    return cache
++
++
++def qsa_sparse_paged_attention_cached(
++    q: torch.Tensor,
++    k_cache: torch.Tensor,
++    v_cache: torch.Tensor,
++    logical_indices: torch.Tensor,
++    block_table: torch.Tensor,
++    token_to_req: torch.Tensor,
++    use_prefill_config: bool,
++    out: torch.Tensor,
++    row_cache: QSARowCache,
++    layer_index: int,
++    *,
++    output_gate: torch.Tensor,
++) -> torch.Tensor:
++    """qsa_sparse_paged_attention through the row cache. Same contract.
++
++    The caller must have run ``row_cache.invalidate`` for this layer's K/V
++    writes of this step first.
++    """
++    assert output_gate.is_contiguous()
++    output_gate_view = output_gate.view_as(q)
++    if not q.shape[0]:
++        return out
++    group_size = q.shape[1] // k_cache.shape[2]
++    selection_width = logical_indices.shape[1] - 1
++    block_n, partial_warps, num_tiles, num_splits = _select_config(
++        q.shape[0], k_cache.shape[2], use_prefill_config, selection_width
++    )
++    tags = row_cache.tags[layer_index]
++    plan_block = QSARowCache._PLAN_BLOCK
++    _qsa_row_cache_plan_kernel[
++        (q.shape[0], triton.cdiv(selection_width, plan_block))
++    ](
++        logical_indices,
++        block_table,
++        token_to_req,
++        tags,
++        row_cache.claim,
++        row_cache.hitmark,
++        row_cache.epoch,
++        logical_indices.stride(0),
++        block_table.stride(0),
++        k_cache.shape[0],
++        block_table.shape[0],
++        TOPK=selection_width,
++        PAGE_SIZE=k_cache.shape[1],
++        PAGE_TABLE_WIDTH=block_table.shape[1],
++        NUM_SLOTS=row_cache.num_slots,
++        BLOCK=plan_block,
++        num_warps=4,
++    )
++
++    if num_splits == 1:
++        partial_output = out
++        partial_lse = out
++    else:
++        partial_output = torch.empty(
++            (num_splits, *q.shape), dtype=torch.float32, device=q.device
++        )
++        partial_lse = torch.empty(
++            (num_splits, q.shape[0], q.shape[1]),
++            dtype=torch.float32,
++            device=q.device,
++        )
++    _qsa_sparse_paged_gqa_cached_kernel[(q.shape[0], k_cache.shape[2], num_splits)](
++        q,
++        k_cache,
++        v_cache,
++        logical_indices,
++        block_table,
++        token_to_req,
++        partial_output,
++        partial_lse,
++        out,
++        output_gate_view,
++        row_cache.region(layer_index),
++        tags,
++        row_cache.claim,
++        row_cache.hitmark,
++        row_cache.epoch,
++        q.stride(0),
++        q.stride(1),
++        k_cache.stride(0),
++        k_cache.stride(1),
++        k_cache.stride(2),
++        v_cache.stride(0),
++        v_cache.stride(1),
++        v_cache.stride(2),
++        logical_indices.stride(0),
++        block_table.stride(0),
++        out.stride(0),
++        out.stride(1),
++        output_gate_view.stride(0),
++        output_gate_view.stride(1),
++        q.shape[0],
++        k_cache.shape[0],
++        block_table.shape[0],
++        TOPK=selection_width,
++        PAGE_SIZE=k_cache.shape[1],
++        PAGE_TABLE_WIDTH=block_table.shape[1],
++        GROUP_SIZE=group_size,
++        HEAD_DIM=q.shape[2],
++        NUM_KV_HEADS=k_cache.shape[2],
++        NUM_QUERY_HEADS=q.shape[1],
++        NUM_SLOTS=row_cache.num_slots,
++        NUM_SPLITS=num_splits,
++        NUM_TILES=num_tiles,
++        BLOCK_M=triton.next_power_of_2(group_size),
++        BLOCK_N=block_n,
++        num_warps=partial_warps,
++        num_stages=2,
++    )
++    if num_splits == 1:
++        return out
++    _qsa_merge_splitk_kernel[(q.shape[0], q.shape[1])](
++        partial_output,
++        partial_lse,
++        out,
++        output_gate_view,
++        out.stride(0),
++        out.stride(1),
++        output_gate_view.stride(0),
++        output_gate_view.stride(1),
++        q.shape[0],
++        HEAD_DIM=q.shape[2],
++        NUM_QUERY_HEADS=q.shape[1],
++        NUM_SPLITS=num_splits,
++        BLOCK_SPLITS=triton.next_power_of_2(num_splits),
++        num_warps=2,
++        num_stages=1,
++    )
++    return out
++
++
+ __all__ = [
++    "QSARowCache",
+     "qsa_compress_groups_with_ratio",
++    "qsa_get_row_cache",
+     "qsa_sparse_paged_attention",
++    "qsa_sparse_paged_attention_cached",
+     "qsa_store_cache_rows",
+     "warmup_qsa_sparse_paged_attention",
+ ]
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index 6741a1c..82de5c4 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -131,6 +131,16 @@ _QSA_STAGE_MIN_ROWS = 64
+ # 3-card block size. All published numbers were measured with this value.
+ _QSA_ARENA_DEFAULT_BYTES = 96 * 1024 * 1024
+ 
++# The decode-time row cache in the staging arena (ops/qsa.py, "Decode-time
++# cache of host K/V rows"). VLLM_QSA_ROW_CACHE=0 turns it off.
++_QSA_ROW_CACHE_ENV = "VLLM_QSA_ROW_CACHE"
++# Decode-sized batches only. Up to 12 rows the kernel has a single launch
++# configuration, which the decode graph captures compile and load at startup.
++# A larger batch, which runs eagerly, would load new kernel variants in the
++# middle of serving, and that memory is not budgeted. Larger batches use the
++# direct path; their K/V writes still drop cached rows.
++_QSA_ROW_CACHE_MAX_ROWS = 12
++
+ # Host RAM kept free after each pool is pinned. Pinned pages cannot be swapped
+ # or reclaimed.
+ _QSA_HOST_RESERVE_BYTES = 4 * 2**30
+@@ -422,7 +432,25 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+             output,
+             output_gate,
+         )
++        row_cache = getattr(layer, "_qsa_row_cache", None)
+         if staged is None:
++            if row_cache is not None and num_tokens <= _QSA_ROW_CACHE_MAX_ROWS:
++                from .ops.qsa import qsa_sparse_paged_attention_cached
++
++                qsa_sparse_paged_attention_cached(
++                    query[:num_tokens],
++                    key_cache,
++                    value_cache,
++                    logical_indices,
++                    attn_metadata.block_table,
++                    token_to_req,
++                    use_prefill_config,
++                    output[:num_tokens],
++                    row_cache,
++                    layer._qsa_row_cache_index,
++                    output_gate=output_gate[:num_tokens],
++                )
++                return output
+             qsa_sparse_paged_attention(
+                 query[:num_tokens],
+                 key_cache,
+@@ -437,6 +465,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+                 output_gate=output_gate[:num_tokens],
+             )
+             return output
++        if row_cache is not None:
++            # Staging overwrote the arena that holds the cached rows.
++            row_cache.invalidate_all()
+         staged_start, staged_end = staged
+         for low, high in ((0, staged_start), (staged_end, num_tokens)):
+             if high > low:
+@@ -594,6 +625,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+         self._qsa_kv_offload = os.environ.get("VLLM_QSA_KV_OFFLOAD", "0") == "1"
+         self._qsa_host_kv = None
+         self._qsa_host_buf = None
++        self._qsa_row_cache = None
++        self._qsa_row_cache_index = None
+         self._qsa_offload_layers = sum(
+             kind in ("full_attention", "qwen_sparse_attention")
+             for kind in config.layer_types
+@@ -654,6 +687,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+         if self.layer_name in static_context:
+             raise ValueError(f"Duplicate layer name: {self.layer_name}")
+         static_context[self.layer_name] = self
++        self._qsa_static_context = static_context
+ 
+     def get_attn_backend(self) -> type[AttentionBackend]:
+         return self.attn_backend
+@@ -702,9 +736,24 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+         if self._qsa_stage_arena_bytes > 0:
+             # Allocate the arena now while GPU memory is free, not at the first
+             # long prefill.
+-            from .ops.qsa import qsa_get_staging_arena
++            from .ops.qsa import qsa_get_row_cache, qsa_get_staging_arena
+ 
+-            qsa_get_staging_arena(self.kv_cache, self._qsa_stage_arena_bytes)
++            arena = qsa_get_staging_arena(
++                self.kv_cache, self._qsa_stage_arena_bytes
++            )
++            if arena is not None and os.environ.get(
++                _QSA_ROW_CACHE_ENV, "1"
++            ).strip() not in ("", "0"):
++                layers_on_rank = sum(
++                    isinstance(module, Qwen4ExpQSAAttention)
++                    and module._qsa_kv_offload
++                    for module in self._qsa_static_context.values()
++                )
++                row_cache = qsa_get_row_cache(arena, layers_on_rank)
++                if row_cache is not None:
++                    self._qsa_row_cache_index = row_cache.add_layer(self.layer_name)
++                    if self._qsa_row_cache_index is not None:
++                        self._qsa_row_cache = row_cache
+ 
+     @eager_break_during_capture
+     def _run_qsa(
+@@ -749,6 +798,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+             self.kv_cache,
+             main_metadata.slot_mapping,
+         )
++        if self._qsa_row_cache is not None:
++            self._qsa_row_cache.invalidate(
++                self._qsa_row_cache_index, main_metadata.slot_mapping
++            )
+         impl.forward_qsa(
+             self,
+             query,

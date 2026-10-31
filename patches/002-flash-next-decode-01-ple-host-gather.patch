@@ -1,0 +1,165 @@
+If you would like to merge this patch upstream, I would appreciate it if you could keep me credited as the commit author, or add the following trailer to the commit message: 
+
+Co-authored-by: Minachist <84688797+aiueonicked@users.noreply.github.com>
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+index 8fe2642..84335b0 100644
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+@@ -573,6 +573,7 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
+ 
+ _PLE_MMAP_PATH_ENV = "VLLM_PLE_MMAP_PATH"
+ _PLE_MMAP_REBUILD_ENV = "VLLM_PLE_MMAP_REBUILD"
++_PLE_HOST_GATHER_ENV = "VLLM_PLE_HOST_GATHER"
+ 
+ # numpy has no bfloat16, so rows are gathered through a same-width int view.
+ _PLE_STORAGE_NUMPY_DTYPES = {1: np.int8, 2: np.int16, 4: np.int32}
+@@ -589,8 +590,17 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+     loads. An existing file of the right size is mapped copy-on-write and not
+     written. ``VLLM_PLE_MMAP_REBUILD=1`` forces a refill.
+ 
+-    Requires ETP=1, and cudagraph mode NONE or PIECEWISE with
+-    ``VLLM_USE_BREAKABLE_CUDAGRAPH=1``.
++    Requires ETP=1.
++
++    The gather reads the ids on the host, so it cannot run inside a CUDA
++    graph. ``Qwen4ExpModelState.prepare_inputs`` calls :meth:`host_gather`
++    before the forward, and :meth:`forward` only reads the filled buffer. This
++    works with every cudagraph mode, including ``FULL_DECODE_ONLY``. PIECEWISE
++    modes also need ``VLLM_USE_BREAKABLE_CUDAGRAPH=1`` for the eager breaks in
++    the GDN, QSA and short-conv layers.
++
++    ``VLLM_PLE_HOST_GATHER=0`` runs the gather inside the forward as earlier
++    releases did, for A/B tests. FULL cudagraph modes are then rejected.
+     """
+ 
+     def __init__(
+@@ -633,25 +643,34 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+                 f"holds the whole table; got ETP={self.tp_size}"
+             )
+ 
++        self.prefetch_from_model_state = (
++            os.environ.get(_PLE_HOST_GATHER_ENV, "1").strip() not in ("", "0")
++        )
++
+         from vllm.compilation.breakable_cudagraph import (
+             is_breakable_cudagraph_enabled,
+         )
+-        from vllm.config.compilation import CUDAGraphMode
+ 
+         cg_mode = get_current_vllm_config().compilation_config.cudagraph_mode
+-        if cg_mode not in (CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE):
++        if not self.prefetch_from_model_state and cg_mode.has_full_cudagraphs():
+             raise RuntimeError(
+-                "mmap PLE requires cudagraph_mode NONE or PIECEWISE, not FULL"
++                f"{_PLE_HOST_GATHER_ENV}=0 keeps the host gather inside the "
++                f"forward, where it cannot be captured; cudagraph_mode "
++                f"{cg_mode.name} requires it hoisted out"
+             )
+-        if cg_mode == CUDAGraphMode.PIECEWISE and not is_breakable_cudagraph_enabled():
++        if cg_mode.has_piecewise_cudagraphs() and not is_breakable_cudagraph_enabled():
+             raise RuntimeError(
+-                "mmap PLE PIECEWISE requires VLLM_USE_BREAKABLE_CUDAGRAPH=1"
++                f"mmap PLE with cudagraph_mode {cg_mode.name} requires "
++                "VLLM_USE_BREAKABLE_CUDAGRAPH=1"
+             )
+ 
+         device = torch.device("cuda", torch.cuda.current_device())
+         self._block_d = triton.next_power_of_2(self.embedding_dim)
+         self._prefetch_stream = torch.cuda.Stream(device=device)
+-        self._prefetch_buffer = torch.empty(
++        # forward() returns a view of this buffer. It is allocated once so graph
++        # replays read a fixed address, and zeroed so a forward that runs
++        # before the first gather reads zeros.
++        self._prefetch_buffer = torch.zeros(
+             max_total_tokens * self.etp_data_parallel_size,
+             num_ngram_heads,
+             self.embedding_dim,
+@@ -790,6 +809,48 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+             )
+         return output
+ 
++    prefetch_from_model_state: bool      # set in __init__ from VLLM_PLE_HOST_GATHER
++
++    # Measured on 3 x RTX 3090. Inside the forward, the device-to-host copy of
++    # the ids blocks the host every step. The host cannot run ahead of the GPU,
++    # and the eager segments on each rank (12 GDN, 4 QSA, 1 PLE short conv)
++    # become GPU idle time. Single-stream decode was 45 tok/s with a GPU-busy
++    # floor of 12.6 ms. Moving the gather out of the forward alone gave
++    # 45.1 tok/s. Moving it out and using FULL_DECODE_ONLY gave 80 tok/s.
++
++    def host_gather(self, ngram_ids: torch.Tensor) -> None:
++        """Fill the lookup buffer. Called before the forward.
++
++        The H2D copy runs on the calling stream, which the forward or its graph
++        replay uses next, so no event is needed.
++        """
++        slot_size, _ = self._get_dp_gather_slot(ngram_ids.shape[0])
++        gathered_ids = self._gather_dp_ids(ngram_ids, slot_size)
++        self._lookup(
++            gathered_ids,
++            output=self._prefetch_buffer[: gathered_ids.shape[0]],
++        )
++
++    def start_prefetch(
++        self,
++        hidden_states: torch.Tensor,
++        ngram_ids: torch.Tensor,
++    ) -> None:
++        """Old in-forward path. Does nothing when host_gather() is used."""
++        if self.prefetch_from_model_state:
++            return
++        super().start_prefetch(hidden_states, ngram_ids)
++
++    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        """Return a view of the rows host_gather() wrote.
++
++        With ETP=1 the all-reduce and DP row selection in _finalize_prefetch do
++        nothing, so only the flatten(-2) remains.
++        """
++        if not self.prefetch_from_model_state:
++            return super().forward(hidden_states)
++        return self._prefetch_buffer[: hidden_states.shape[0]].flatten(-2)
++
+ 
+ class Qwen4ExpNGramEmbedding(nn.Module):
+     _MASK64 = (1 << 64) - 1
+@@ -1115,6 +1176,27 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+         ngram_ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
+         return self.ngram_embedding(ngram_ids).flatten(-2)
+ 
++    def host_gather(
++        self,
++        input_ids: torch.Tensor,
++        query_start_loc: torch.Tensor,
++        ngram_context: torch.Tensor,
++    ) -> None:
++        """Compute the n-gram ids and run the mmap backend's host_gather().
++
++        Called from Qwen4ExpModelState.prepare_inputs. Does nothing for the
++        device and pinned backends.
++        """
++        embedding = self.ngram_embedding
++        if not getattr(embedding, "prefetch_from_model_state", False):
++            return
++        ngram_ids = self.compute_ngram_ids(
++            input_ids,
++            query_start_loc,
++            ngram_context,
++        )
++        embedding.host_gather(ngram_ids)
++
+     def start_prefetch(
+         self,
+         hidden_states: torch.Tensor,
+@@ -1126,6 +1208,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+         embedding = self.ngram_embedding
+         if not embedding.supports_prefetch:
+             return
++        if getattr(embedding, "prefetch_from_model_state", False):
++            # host_gather() already ran. Computing the ids again would add a
++            # kernel to every forward.
++            return
+         ngram_ids = self.compute_ngram_ids(
+             input_ids,
+             query_start_loc,

@@ -1,0 +1,64 @@
+local-12: spread decodes over the PP microbatches (V2 + PP + async scheduling)
+
+With PP microbatching a request may decode only every pp_size steps
+(next_decode_eligible_step). Decodes scheduled in the same step therefore stay
+in the same microbatch forever: two requests that start together share one
+microbatch and two of the three stages idle. Measured on Swift Flash-Next PP=3,
+MTP n=2, 2 streams x 800 tokens: started together ~102 t/s total (51 + 51),
+started 0.4-1.5 s apart 148-164 t/s (75-83 each). This caps the decodes taken
+per step at ceil(running decodes / pp_size), so with 2 decodes each step takes
+one and they settle into separate microbatches. Prefill chunks are not capped.
+VLLM_PP_DECODE_SPREAD=0 restores the old behavior. Not upstream (no open PR).
+Scheduler unit tests: same 2 pre-existing PP-config failures, no new ones.
+
+Binary files a/vllm/v1/core/sched/__pycache__/scheduler.cpython-312.pyc and b/vllm/v1/core/sched/__pycache__/scheduler.cpython-312.pyc differ
+diff -ruN a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py	2026-10-21 21:40:50.214692052 +0700
++++ b/vllm/v1/core/sched/scheduler.py	2026-10-21 21:40:50.242692040 +0700
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -636,6 +637,24 @@
+                 long_prefill_token_threshold, input_budget // num_eligible_reqs
+             )
+ 
++        # local-12: with PP microbatching every decode waits pp_size steps after
++        # its last step, so decodes scheduled in the same step stay in the same
++        # microbatch for good and the other stages idle (2 requests that start
++        # together: ~100 t/s total vs ~155 t/s when they start apart, Swift
++        # Flash-Next PP=3). Capping decodes per step at ceil(decodes / pp_size)
++        # spreads them over the microbatches. VLLM_PP_DECODE_SPREAD=0 disables.
++        pp_decode_cap = 0
++        if (
++            self.use_pp
++            and self.use_v2_model_runner
++            and os.environ.get("VLLM_PP_DECODE_SPREAD", "1").strip() not in ("", "0")
++        ):
++            num_decodes = sum(1 for r in self.running if not r.is_prefill_chunk)
++            if num_decodes > 1:
++                pp_size = self.parallel_config.pipeline_parallel_size
++                pp_decode_cap = -(-num_decodes // pp_size)
++        pp_decodes_scheduled = 0
++
+         # First, schedule the RUNNING requests.
+         req_index = 0
+         while req_index < len(self.running) and token_budget > 0:
+@@ -665,6 +684,13 @@
+                 req_index += 1
+                 continue
+ 
++            if pp_decode_cap and not request.is_prefill_chunk:
++                if pp_decodes_scheduled >= pp_decode_cap:
++                    # local-12: leave it for the next microbatch.
++                    req_index += 1
++                    continue
++                pp_decodes_scheduled += 1
++
+             if defer_prefills and request.is_prefill_chunk:
+                 # DP prefill balancing: defer this in-progress prefill chunk to a
+                 # cadence-aligned step; decodes still run to fill this step.

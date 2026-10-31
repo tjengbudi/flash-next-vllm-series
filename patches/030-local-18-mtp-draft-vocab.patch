@@ -1,0 +1,313 @@
+local-18: draft-only vocabulary for the Qwen4Exp MTP drafter (own patch).
+
+Greedy MTP drafts are scored by a small second head holding only a fixed subset
+of the vocabulary (the checkpoint's own INT8 rows + group scales, same Marlin
+W8A16 quant method as the target lm_head) instead of the shared 248,320-row
+head. The target verifies with the full head, so outputs are unchanged; only
+acceptance can drop (a token outside the subset is never drafted).
+
+  VLLM_MTP_DRAFT_VOCAB  unset/0 = off (nothing built, l15 code paths)
+                        1       = baked list mtp_draft_vocab_ids.json
+                                  (HyperQwen's 40,960 ids, Apache-2.0)
+                        /path   = JSON list of ids (or a .pt tensor)
+Kept on the full head: draft_sample_method=probabilistic, adaptive
+verification, tied embeddings. Ideas from HyperQwen
+(qwen3_5-mtp-draft-vocab.patch) and DominikBucko (draft_vocab.py), both
+Apache-2.0; no code from miaai (AGPL).
+
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -13,6 +13,7 @@
+     multi stream [T, hc_count*H] (fed to the next draft step).
+ """
+ 
++import json
+ import os
+ from collections.abc import Iterable
+ from contextlib import nullcontext
+@@ -23,13 +24,17 @@
+ 
+ from vllm.config import VllmConfig, replace, set_current_vllm_config
+ from vllm.distributed import get_pp_group
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe.utils import (
+     is_model_fused_shared_expert_compatible,
+ )
+ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+ from vllm.model_executor.layers.linear import ColumnParallelLinear
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    VocabParallelEmbedding,
++)
+ from vllm.model_executor.model_loader.utils import configure_quant_config
+ from vllm.model_executor.models.interfaces import SupportsPP
+ from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
+@@ -57,6 +62,106 @@
+     Qwen4ExpSparseMoeBlock,
+ )
+ 
++logger = init_logger(__name__)
++
++# local-18: draft-only vocabulary for the MTP drafter.
++#
++# Greedy drafting only needs the argmax of the draft logits, yet the shared
++# lm_head scores all 248,320 ids (an INT8 read of ~636 MB per draft step). With
++# VLLM_MTP_DRAFT_VOCAB set, greedy drafts are scored by a second, small head
++# that holds only a fixed subset of rows: the checkpoint's own INT8 rows and
++# group scales, built with the same quant method (Marlin W8A16 on sm_86) as
++# the target head. The target still verifies with the full head, so outputs
++# are unchanged; a token outside the subset is never drafted, which can only
++# lower acceptance. Probabilistic drafting and adaptive verification need the
++# full draft logits and keep the full head.
++#
++#   VLLM_MTP_DRAFT_VOCAB=0 or unset  off (no extra memory, l15 behaviour)
++#   VLLM_MTP_DRAFT_VOCAB=1           the id list baked next to this file
++#   VLLM_MTP_DRAFT_VOCAB=/path.json  a JSON list of token ids (or a .pt tensor)
++DRAFT_VOCAB_BAKED_IDS = os.path.join(
++    os.path.dirname(os.path.abspath(__file__)), "mtp_draft_vocab_ids.json"
++)
++
++
++def draft_vocab_ids_path() -> str | None:
++    value = os.environ.get("VLLM_MTP_DRAFT_VOCAB", "0").strip()
++    if value in ("", "0"):
++        return None
++    return DRAFT_VOCAB_BAKED_IDS if value == "1" else value
++
++
++def load_draft_vocab_ids(path: str, vocab_size: int) -> torch.Tensor:
++    """Sorted, unique int64 ids; sorted keeps argmax's lowest-id tie break."""
++    if path.endswith(".pt"):
++        ids = torch.as_tensor(torch.load(path, map_location="cpu"))
++    else:
++        with open(path, encoding="utf-8") as f:
++            ids = torch.tensor(json.load(f), dtype=torch.int64)
++    ids = torch.unique(ids.to(torch.int64).flatten())
++    if ids.numel() == 0 or int(ids[0]) < 0 or int(ids[-1]) >= vocab_size:
++        raise ValueError(
++            f"draft vocabulary {path}: ids must be non-empty and in [0, {vocab_size})"
++        )
++    return ids
++
++
++def build_draft_vocab_head(
++    ids: torch.Tensor,
++    head_tensors: dict[str, torch.Tensor],
++    vocab_size: int,
++    hidden_size: int,
++    quant_config,
++    device: torch.device,
++    params_dtype: torch.dtype | None = None,
++    prefix: str = "lm_head",
++) -> ParallelLMHead:
++    """A ParallelLMHead over `ids`, from the full head's checkpoint tensors.
++
++    `head_tensors` maps the head's parameter names (weight, or weight_packed /
++    weight_scale / weight_shape for compressed-tensors) to the full-vocab
++    tensors (or to tensors already cut down to `ids`). Rows are selected on
++    the output (vocab) dim, so each kept row is bit-identical to the target
++    head's row before the kernel repack.
++    """
++    num_ids = ids.numel()
++    with torch.device(device):
++        head = ParallelLMHead(
++            num_ids,
++            hidden_size,
++            params_dtype=params_dtype,
++            quant_config=quant_config,
++            prefix=prefix,
++        )
++    ids_cpu = ids.cpu()
++    for name, param in head.named_parameters():
++        if name not in head_tensors:
++            raise ValueError(f"checkpoint has no lm_head.{name}")
++        src = head_tensors[name]
++        output_dim = getattr(param, "output_dim", None)
++        if name == "weight_shape":
++            loaded = torch.tensor([num_ids, hidden_size], dtype=src.dtype)
++        elif output_dim is None:
++            loaded = src
++        else:
++            if getattr(param, "packed_dim", None) == output_dim:
++                raise ValueError(f"lm_head.{name} is packed on the vocab dim")
++            if src.shape[output_dim] == vocab_size:
++                loaded = src.index_select(output_dim, ids_cpu.to(src.device))
++            elif src.shape[output_dim] == num_ids:
++                loaded = src
++            else:
++                raise ValueError(
++                    f"lm_head.{name} has {src.shape[output_dim]} rows, "
++                    f"expected {vocab_size}"
++                )
++        # Host -> device straight into the parameter: no second device copy.
++        param.weight_loader(param, loaded)
++    quant_method = head.quant_method
++    if hasattr(quant_method, "process_weights_after_loading"):
++        quant_method.process_weights_after_loading(head)
++    return head
++
+ 
+ def _remap_ignored_layers(
+     ignored_layers: list[str],
+@@ -440,6 +545,32 @@
+             self.lm_head = PPMissingLayer()
+ 
+         self.logits_processor = LogitsProcessor(config.vocab_size)
++        # local-18: draft-only vocabulary (off unless VLLM_MTP_DRAFT_VOCAB).
++        self._draft_vocab_path: str | None = None
++        self._draft_vocab_load_ids: torch.Tensor | None = None
++        self._draft_vocab_tensors: dict[str, torch.Tensor] = {}
++        self._draft_vocab_head: ParallelLMHead | None = None
++        self._draft_vocab_ids: torch.Tensor | None = None
++        self._draft_vocab_num = 0
++        path = draft_vocab_ids_path()
++        spec_config = vllm_config.speculative_config
++        if path is not None and get_pp_group().is_last_rank:
++            if config.tie_word_embeddings:
++                logger.warning("local-18: tied embeddings, draft vocabulary off")
++            elif spec_config is not None and (
++                spec_config.draft_sample_method != "greedy"
++                or spec_config.enable_adaptive_verification
++            ):
++                logger.warning(
++                    "local-18: draft vocabulary needs greedy drafting without "
++                    "adaptive verification; keeping the full head"
++                )
++            else:
++                # A bad list fails the boot here, before any weight is read.
++                self._draft_vocab_load_ids = load_draft_vocab_ids(
++                    path, config.vocab_size
++                )
++                self._draft_vocab_path = path
+         self.make_empty_intermediate_tensors = (
+             self.model.make_empty_intermediate_tensors
+         )
+@@ -469,6 +600,73 @@
+ 
+     def process_weights_after_loading(self) -> None:
+         self.model.move_embed_to_host()
++        self._maybe_build_draft_vocab_head()
++
++    def _draft_vocab_rows(self, weight: torch.Tensor) -> torch.Tensor:
++        ids = self._draft_vocab_load_ids
++        assert ids is not None
++        if weight.dim() >= 1 and weight.shape[0] == self.config.vocab_size:
++            weight = weight.index_select(0, ids.to(weight.device))
++        return weight.detach().to("cpu").clone()
++
++    @property
++    def draft_vocab_active(self) -> bool:
++        return self._draft_vocab_head is not None
++
++    def _maybe_build_draft_vocab_head(self) -> None:
++        """local-18: build the sub-head last, after every layer's repack."""
++        path, tensors = self._draft_vocab_path, self._draft_vocab_tensors
++        ids = self._draft_vocab_load_ids
++        self._draft_vocab_path, self._draft_vocab_tensors = None, {}
++        self._draft_vocab_load_ids = None
++        if path is None or ids is None:
++            return
++        if not tensors:
++            logger.warning(
++                "local-18: the draft load saw no lm_head tensors; draft "
++                "vocabulary off"
++            )
++            return
++        try:
++            head = build_draft_vocab_head(
++                ids,
++                tensors,
++                self.config.vocab_size,
++                self.config.hidden_size,
++                self.quant_config,
++                self.model._device,
++                params_dtype=self.vllm_config.model_config.dtype,
++            )
++        except Exception as e:  # keep serving with the full head
++            logger.warning("local-18: draft vocabulary off: %s", e)
++            return
++        del tensors
++        self._draft_vocab_head = head
++        self._draft_vocab_ids = ids.to(self.model._device)
++        self._draft_vocab_num = ids.numel()
++        nbytes = sum(p.numel() * p.element_size() for p in head.parameters())
++        kernel = getattr(getattr(head, "scheme", None), "kernel", head.quant_method)
++        logger.info(
++            "local-18: MTP greedy drafts use a %d-of-%d id draft vocabulary "
++            "(%s, %s, %.1f MiB)",
++            ids.numel(),
++            self.config.vocab_size,
++            path,
++            type(kernel).__name__,
++            nbytes / 2**20,
++        )
++
++    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        """Greedy draft ids. With the draft vocabulary, the argmax over its
++        rows only (sorted ids, so ties keep the lowest id like the full head);
++        without it, the full head's argmax."""
++        head = self._draft_vocab_head
++        if head is None:
++            return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
++        logits = head.quant_method.apply(head, hidden_states, bias=None)
++        logits = logits[..., : self._draft_vocab_num]
++        assert self._draft_vocab_ids is not None
++        return self._draft_vocab_ids[logits.argmax(dim=-1)]
+ 
+     def compute_logits(
+         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
+@@ -479,6 +677,18 @@
+         def remap_weight_names():
+             for name, weight in weights:
+                 remapped_name = _remap_mtp_weight_name(name)
++                if (
++                    self._draft_vocab_path is not None
++                    and remapped_name is not None
++                    and remapped_name.startswith("lm_head.")
++                ):
++                    # local-18: keep the subset's rows of the full head's
++                    # checkpoint tensors (on the host) for the draft-vocabulary
++                    # sub-head; the loader still skips them for the shared
++                    # head, as before.
++                    self._draft_vocab_tensors[
++                        remapped_name.removeprefix("lm_head.")
++                    ] = self._draft_vocab_rows(weight)
+                 if remapped_name is not None:
+                     yield remapped_name, weight
+ 
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -136,6 +136,10 @@
+         self.use_local_argmax_reduction = (
+             self.speculative_config.use_local_argmax_reduction
+         )
++        # local-18: set in load_model() when the draft model built a draft-only
++        # vocabulary (VLLM_MTP_DRAFT_VOCAB); greedy drafts then come from its
++        # get_top_tokens() instead of full-vocab logits.
++        self.use_draft_vocab_top_tokens = False
+ 
+         # DP configuration
+         self.dp_size = vllm_config.parallel_config.data_parallel_size
+@@ -219,6 +223,11 @@
+ 
+         self.model = self.load_draft_model(target_model, target_attn_layer_names)
+         self._validate_local_argmax_reduction()
++        self.use_draft_vocab_top_tokens = (
++            bool(getattr(self.model, "draft_vocab_active", False))
++            and self.speculative_config.draft_sample_method == "greedy"
++            and not self.use_acceptance_estimator
++        )
+ 
+         all_attn_layers = get_layers_from_vllm_config(
+             self.vllm_config,
+@@ -427,7 +436,7 @@
+                 sampled = self.draft_watermarker.sample(
+                     logits, sampled, idx_mapping, temperature
+                 )
+-        elif self.use_local_argmax_reduction:
++        elif self.use_local_argmax_reduction or self.use_draft_vocab_top_tokens:
+             return self.model.get_top_tokens(hidden_states)
+         else:
+             logits = self.model.compute_logits(hidden_states)

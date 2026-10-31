@@ -1,0 +1,81 @@
+local-11: reserve spec-decode blocks per KV cache group for async KV loads (vLLM #59880, in v0.32.0)
+
+With a KV connector loading asynchronously (our CPU tier, local-08), the
+scheduler reserves room for the full sequence plus one spec-decode step before
+admitting the load. It sized that step with the global block size only, so with
+several groups of different block sizes (ours: 20 x 9984 + one 8-token group)
+it under-reserved and, under KV pressure, a loaded request could be unable to
+start decoding. Now every non-Mamba group is counted with its own block size.
+Upstream diff as-is except the last hunk (removal of _spec_decode_step_blocks),
+re-anchored for the 0.31 tree. Unit tests (0.31 tests + the PR's): the PR's
+multiple-groups and different-block-sizes cases fail before, pass after; the
+2 other scheduler failures are pre-existing (PP config validation in the test env).
+Drop when the image moves to vLLM >= 0.32.
+
+Binary files a/vllm/v1/core/sched/__pycache__/scheduler.cpython-312.pyc and b/vllm/v1/core/sched/__pycache__/scheduler.cpython-312.pyc differ
+diff -ruN a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py	2026-10-21 19:56:41.049959008 +0700
++++ b/vllm/v1/core/sched/scheduler.py	2026-10-21 19:56:53.213944333 +0700
+@@ -329,6 +329,17 @@
+                 self.cache_config.enable_mamba_shared_prefix_checkpoint
+             ),
+         )
++        # Mamba managers already account for their speculative state blocks.
++        num_spec_decode_tokens = (
++            1 + self.num_spec_tokens + self.num_lookahead_tokens
++            if self.num_spec_tokens
++            else 0
++        )
++        self._spec_decode_step_blocks = sum(
++            cdiv(num_spec_decode_tokens, manager.block_size)
++            for manager in self.kv_cache_manager.coordinator.single_type_managers
++            if not isinstance(manager.kv_cache_spec, MambaSpec)
++        )
+         # Bind after construction so connectors can access the cache manager.
+         if self.connector is not None:
+             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
+@@ -1200,7 +1211,7 @@
+                     # predictable preemptions.
+                     reserved_blocks = (
+                         self._inflight_prefill_reserved_blocks()
+-                        + self._spec_decode_step_blocks()
++                        + self._spec_decode_step_blocks
+                     )
+ 
+                 # Replayed tokens are already counted in the adopted hit; a
+@@ -3003,9 +3014,12 @@
+     def _request_remaining_blocks(self, request: Request) -> int:
+         """Blocks `request` still needs to hold its full sequence and be promoted."""
+         full_num_tokens = min(request.num_tokens, self.max_model_len)
+-        num_blocks = self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
++        num_tokens = full_num_tokens
++        if self.num_spec_tokens:
++            num_tokens += 1 + self.num_spec_tokens + self.num_lookahead_tokens
++        return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+             request_id=request.request_id,
+-            num_tokens=full_num_tokens,
++            num_tokens=num_tokens,
+             new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
+             num_encoder_tokens=0,
+             total_computed_tokens=request.num_computed_tokens,
+@@ -3014,20 +3028,6 @@
+             apply_admission_cap=True,
+             prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
+         )
+-        return num_blocks + self._spec_decode_step_blocks()
+-
+-    def _spec_decode_step_blocks(self) -> int:
+-        """Number of blocks for the extra KV slots a spec decode step needs.
+-
+-        When using async kv load, scheduler must reserve enough blocks for
+-        full sequence + the spec decode step, otherwise request cannot be
+-        able to run after the async_load if we are out of kv blocks.
+-        """
+-        if not self.num_spec_tokens:
+-            return 0
+-        return cdiv(
+-            1 + self.num_spec_tokens + self.num_lookahead_tokens, self.block_size
+-        )
+ 
+     def _inflight_prefill_reserved_blocks(self) -> int:
+         """Num blocks in-flight prefills still need to finish (their reservation)."""

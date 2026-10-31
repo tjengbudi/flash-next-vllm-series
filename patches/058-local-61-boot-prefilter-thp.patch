@@ -1,0 +1,89 @@
+Binary files a/vllm/model_executor/model_loader/__pycache__/weight_utils.cpython-312.pyc and c/vllm/model_executor/model_loader/__pycache__/weight_utils.cpython-312.pyc differ
+diff -ruN a/vllm/model_executor/model_loader/weight_utils.py c/vllm/model_executor/model_loader/weight_utils.py
+--- a/vllm/model_executor/model_loader/weight_utils.py	2026-10-03 15:06:30.000000000 +0700
++++ c/vllm/model_executor/model_loader/weight_utils.py	2026-10-30 17:33:51.107008549 +0700
+@@ -1747,3 +1747,34 @@
+     for name, weight in weights:
+         remapped_name = maybe_remap_moe_expert_param_name(name, params_dict)
+         yield (remapped_name, weight)
++
++
++# --- qwen38-flash-dgx: optional keep-filter in front of should_skip_weight (patch 18) ---
++import contextlib as _qwen38_pf_contextlib
++
++_qwen38_keep_name = None
++_qwen38_keep_stats = [0, 0]  # kept, skipped
++_qwen38_should_skip_weight = should_skip_weight
++
++
++def should_skip_weight(weight_name, local_expert_ids):  # noqa: F811
++    keep = _qwen38_keep_name
++    if keep is not None:
++        if not keep(weight_name):
++            _qwen38_keep_stats[1] += 1
++            return True
++        _qwen38_keep_stats[0] += 1
++    return _qwen38_should_skip_weight(weight_name, local_expert_ids)
++
++
++@_qwen38_pf_contextlib.contextmanager
++def qwen38_keep_only(keep, what: str):
++    global _qwen38_keep_name
++    prev, _qwen38_keep_name = _qwen38_keep_name, keep
++    _qwen38_keep_stats[:] = [0, 0]
++    try:
++        yield
++    finally:
++        _qwen38_keep_name = prev
++        logger.info("qwen38 %s name prefilter: %d tensors kept, %d skipped before reading "
++                    "(VLLM_MTP_NAME_PREFILTER=0 disables)", what, *_qwen38_keep_stats)
+diff -ruN a/vllm/models/qwen4_exp/nvidia/mtp.py c/vllm/models/qwen4_exp/nvidia/mtp.py
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py	2026-10-29 18:52:55.000000000 +0700
++++ c/vllm/models/qwen4_exp/nvidia/mtp.py	2026-10-30 17:33:51.108008548 +0700
+@@ -192,6 +192,9 @@
+     }
+ 
+ 
++import os as _qwen38_os_pf  # qwen38-flash-dgx patch 18
++
++
+ def _remap_mtp_weight_name(name: str) -> str | None:
+     """Map Qwen4Exp checkpoint paths into the standalone draft model."""
+     for checkpoint_prefix in (
+@@ -749,7 +752,14 @@
+             self,
+             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+         )
+-        return loader.load_weights(remap_weight_names(), mapper=mapper)
++        if _qwen38_os_pf.environ.get("VLLM_MTP_NAME_PREFILTER", "1") == "0" or getattr(
++            self, "secondary_weights", ()
++        ):
++            return loader.load_weights(remap_weight_names(), mapper=mapper)
++        from vllm.model_executor.model_loader import weight_utils as _q38_wu
++
++        with _q38_wu.qwen38_keep_only(lambda n: _remap_mtp_weight_name(n) is not None, "MTP"):
++            return loader.load_weights(remap_weight_names(), mapper=mapper)
+ 
+ 
+ __all__ = ["Qwen4ExpMTP", "Qwen4ExpMultiTokenPredictor"]
+Binary files a/vllm/models/qwen4_exp/nvidia/__pycache__/mtp.cpython-312.pyc and c/vllm/models/qwen4_exp/nvidia/__pycache__/mtp.cpython-312.pyc differ
+Binary files a/vllm/models/qwen4_exp/nvidia/__pycache__/qsa.cpython-312.pyc and c/vllm/models/qwen4_exp/nvidia/__pycache__/qsa.cpython-312.pyc differ
+diff -ruN a/vllm/models/qwen4_exp/nvidia/qsa.py c/vllm/models/qwen4_exp/nvidia/qsa.py
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py	2026-10-30 09:45:01.000000000 +0700
++++ c/vllm/models/qwen4_exp/nvidia/qsa.py	2026-10-30 17:34:07.241987603 +0700
+@@ -244,7 +244,14 @@
+                     "this check with a fixed limit."
+                 )
+         buf = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+-        if hasattr(mmap, "MADV_HUGEPAGE"):
++        # local-61: VLLM_QSA_HOST_THP=0 skips MADV_HUGEPAGE. With THP defrag
++        # "madvise", every fault of a madvised region runs direct compaction,
++        # which on a host whose RAM is full of page cache fails more often than
++        # it succeeds and stretches the pin of one 1.9 GiB pool from ~2 s to
++        # ~60 s. 4 KiB pages fault without it; DMA and UVA work on either.
++        if hasattr(mmap, "MADV_HUGEPAGE") and os.environ.get(
++            "VLLM_QSA_HOST_THP", "1"
++        ) != "0":
+             try:
+                 buf.madvise(mmap.MADV_HUGEPAGE)
+             except OSError:

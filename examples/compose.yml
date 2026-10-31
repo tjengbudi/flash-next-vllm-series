@@ -1,0 +1,468 @@
+# ===========================================================================
+# Swift 1.5 Qwen3.8-Flash-Next Uncensored (INT4 mixed AutoRound + INT4 MTP) on
+# 3 x 24 GB GPUs with the v0.31.0 Flash-Next patch series of this repository.
+#
+#   Model:     tjengbudi/Swift1.5-Qwen3.8-Flash-Next-Uncensored-INT4-Mixed-AutoRound-MTP
+#   Topology:  pipeline parallel 3 (layers 16,17,15; TP is not supported by the patches)
+#   Drafter:   MTP n=2 (+ GPU n-gram lookup while one request runs)
+#   KV:        fp8_e4m3 QSA K/V, host-RAM KV offload tier (KV_OFFLOAD_GB, default 40)
+#   PLE table: INT8, locked in RAM (52 GB). FLASH_NEXT_PLE_INT8= (empty) serves BF16 instead
+#   Vision:    yes (16 images per prompt, 2 MP each; video off)
+#   Max ctx:   262,144 tokens, up to 3 sequences
+#
+#   MODEL_DIR=/path/to/model docker compose -f examples/compose.yml up -d
+#
+# Tested only on 3 x RTX 3090, PCIe without P2P, 147 GiB host RAM. Needs a lot of
+# pinned host RAM: the INT8 PLE table (~48 GiB) + KV_OFFLOAD_GB + the QSA host K/V
+# pool. Lower KV_OFFLOAD_GB (or set it empty to turn the tier off) on smaller hosts.
+# The comments below are the measurement log of that rig: each knob, why it has its
+# value, and the env var to roll it back. "GPU 1" in them is the middle PP stage,
+# the one with the least free memory.
+# There is no moderation in front of the model. Add your own.
+# ===========================================================================
+services:
+  flash-next:
+    # Default v031 + local-06/07 since 2026-10-12, + local-08 (-tier: CPU KV
+    # tier with QSA host K/V), local-09 (/v1/systemone from vLLM 0.32) and
+    # local-10 (M-RoPE cache at 1x positions, -160 MiB on GPU 1) since
+    # 2026-10-21, + local-11 (vLLM #59880: per-group spec-decode reservation
+    # for async KV loads) and local-12 (decodes spread over the PP microbatches:
+    # 2 streams ~102 -> ~152 t/s total) since 2026-10-21, + local-14 (vLLM
+    # #58763: GDN spec-decode slices instead of host-mask gathers) and local-15
+    # (split top-p sampler bundle #61213/#62046/#61996/#58231) since 2026-10-22:
+    # 2/3 streams ~150/153 -> ~175/173 t/s total (rollback:
+    # FLASH_NEXT_MTP_IMAGE=flash-next-vllm-mtp:v031-fp8kv-tier-l14, -tier-l12,
+    # -tier-l11, -tier-l10, -tier-l09, -tier or :v031-fp8kv;
+    # VLLM_PP_DECODE_SPREAD=0 turns l12 off).
+    # 2026-10-22: default -tier-l23 = l15 + local-21 (decode attention metadata replayed
+    # from recorded CUDA graphs, VLLM_CG_ATTN_META=1) + local-18 (MTP draft vocab, English +
+    # Indonesian 47,104-id list). Rig: decode 1/2/3 streams 111.6/212.0/227.5 t/s (l15
+    # 106/175/172), bench 134.2/166.8, max-load suite PASS. Roll back with
+    # FLASH_NEXT_MTP_IMAGE=...-tier-l15 (or VLLM_CG_ATTN_META=0 / VLLM_MTP_DRAFT_VOCAB=0).
+    # 2026-10-23: default -tier-l24 = l23 + local-20 (#47686 packed PP broadcast,
+    # VLLM_PP_PACKED_BCAST=1). Rig A-X-A-X-A: 2/3 streams 208.9/227.0 vs l23 203.0/221.2
+    # (+3%/+2.6%), single/bench/prefill equal. Roll back: ...-tier-l23 or VLLM_PP_PACKED_BCAST=0.
+    # 2026-10-23: default -tier-l24e = l24 + local-21c/d/e: deterministic token order
+    # inside each expert run of the Marlin int4 MoE (the atomic moe_align_block_size
+    # order + Marlin K-split gave 1-ulp run-to-run differences on the 82-SM 3090s),
+    # one Triton kernel, prefill only (>= 10 rows). Rig: repeats 0/12 drift (l24 5/12),
+    # cold 90K prefill 2593 vs 2591/2581, decode within noise. Off: VLLM_MARLIN_MOE_DET_ALIGN=0.
+    # 2026-10-23: default -tier-l29 = l24e + local-29 (PLE n-gram context built on PP
+    # rank 0 only; later ranks never read it). Rig vs l24e: 1/2/3 streams 114.1/206.1/236.0
+    # vs 110.9/206.4/228.4, bench equal, verify-full 9/9. Off: VLLM_PLE_CTX_ALL_RANKS=1.
+    # 2026-10-23: default -tier-l30 = l29 + local-30 (MTP drafter draft-step attention
+    # metadata replayed from recorded CUDA graphs on PP2). Rig vs l29: 3 streams
+    # 243.4/244.3 vs 236.0/239.1 (+2.8%), 1/2 streams and bench equal, verify-full 9/9.
+    # Off: VLLM_CG_DRAFT_META=0.
+    # 2026-10-23: default -tier-l34 = l30 + local-34 (PLE decode madvise: page dedupe +
+    # 3 helper threads on PP0). Rig vs l30: 1/2 streams 114.2/113.1 and 209.2/208.5 vs
+    # 110.3/110.1 and 203.2/202.8 (+3%); 3 streams, bench, cold prefill equal; verify 9/9.
+    # Off: VLLM_PLE_ADVISE_DEDUPE=0 VLLM_PLE_ADVISE_THREADS=1.
+    # 2026-10-23: default -tier-l36 = l34 + local-35 (#60615 GPU n-gram lookup before MTP,
+    # only while exactly one request runs; on via SPEC_EXTRA below). Rig vs l34: 1-stream
+    # copy/edit prompts +7..+12% (acceptance 3.00), essays and 2-3 streams unchanged,
+    # bench equal, verify 9/9. Off: VLLM_NGRAM_SINGLE_ONLY=0 = l19 behaviour, or
+    # SPEC_EXTRA=',"disable_eagle_block_drop":true' = no n-gram.
+    # 2026-10-23: default -tier-l37 = l36 + local-37 (whole decode verify: draft gather +
+    # sampling params + rejection, replayed from one recorded CUDA graph on PP2). Rig vs
+    # l36/l34: 2/3 streams 214.3/214.5 and 245.1/244.9 vs <=211.0 and <=242.7 (+1.2..1.6%);
+    # 1 stream, bench, cold 90K prefill (2606) equal; verify 9/9. Off: VLLM_FAST_SAMPLE=0.
+    # 2026-10-25: default -tier-l41 = l37 + local-41 (CPU tier: a chunk loaded only up to a
+    # partial-tail boundary was marked stored, so it was never stored once full and every later
+    # turn of the session stopped at that old tail). Rig, 3 agent sessions, per 5 min: tier hit
+    # 91-93% vs 50-64%, recomputed 141-222K vs 498-551K tokens, generation 117-129 vs 59-73 t/s;
+    # bench 136.1/169.9 (l37 131.5/167.4), prefill 10K/90K 3903/3176, verify 9/9.
+    # 2026-10-27: default -tier-l43 = l41 + local-43 (copy-on-write block copies one pair at
+    # a time). l41 at 780M KV died on GPU1 (OOM, engine dead) when 3 new requests hit the
+    # prefix cache at once: blocks[dst] = blocks[src] built a 186 MiB temporary with ~150 MiB
+    # free. Rig l43: same 3-stream run passed twice, 1/2/3 streams 128/245/286 t/s (l41
+    # 127/252/290), bench 133.9/168.4, verify 9/9, 3x90K 0 preemptions. Rollback: l41.
+    # 2026-10-27: default -tier-l45 + RecoverSSM ON (= l43 + local-42 RecoverSSM PP=3,
+    # local-44 deferred PP commit graphs, local-45 GDN metadata reuse). One Mamba state slot
+    # per request: blocks/request at 20K 61.3 -> 23.1, GPU KV 605K -> 953K tokens (2.31x ->
+    # 3.64x at 262K), 3x150K all on GPU, 0 preemptions. Rig vs l43: streams 1/2/3 124/244/282
+    # (128/245/286), bench 132.8/161.2 (133.9/168.4), 3x90K turn 1 87-92 s (= l43), cold
+    # prefill 10K/30K/90K 3410/4320/3760, verify 9/9, quality --quick TC 14/15 IF 15/15.
+    # Rollback: FLASH_NEXT_MTP_IMAGE=...-tier-l43 FLASH_NEXT_REPLAYSSM=--no-use-replayssm
+    # VLLM_RECOVERSSM_PP=0 (or the .pre-l45 backup).
+    # 2026-10-27: default -tier-l46 = l45 + local-46 (/v1/systemone fixes: vllm#61219 logprob
+    # token ids under MTP verify, vllm#61192 shared-prefix warm-up on hybrid models). Rig:
+    # decisions next to 2 chats 6/6 HTTP 400 -> 0/6; 4/16 questions on a 2K state 4.4/15.6 ->
+    # 3.1/6.7 s; streams 123/243/281, bench 132.0/162.0, verify 9/9, greedy = l45. Rollback: l45.
+    # 2026-10-27: default -tier-l47 = l46 + local-47 (decision endpoints re-based on upstream
+    # main c32575477 + open PRs #61251 #63543 #63515 #61190 #62472 #62158 #61216 #63509).
+    # New: OpenAI-format POST /v1/decisions, images on /v1/systemone, unknown request fields
+    # rejected (400). Rig vs l46: burst of 4x16-question decisions on 10K states 53.8 ->
+    # 38.0 s (each 51 -> 26 s; a 1-question decision during the burst p50 1.9 -> 6.7 s,
+    # max 10.2 -> 9.1 s: the engine is busy instead of waiting on tokenization), 16 questions
+    # on a 20K state 12.7 -> 11.9 s, 2K-state scale and decisions next to chats unchanged;
+    # greedy = l46, verify 9/9, streams 124/246/283, bench 134.1/161.3. Rollback: l46.
+    # 2026-10-28: default -tier-l48b = l47 + local-48 (#54627 prefill-schedule-interval, made
+    # local to this non-DP engine) + local-48b (VLLM_PREFILL_CADENCE_BURST consecutive prefill
+    # steps, so PP=3 stays pipelined), interval 96 / burst 12. Rig, 200K cold prefill next to
+    # 2 decoding streams: prefill 81 -> 114-121 s, decode of the others 3.5-4 -> 25-28 t/s
+    # (longest pause ~4 s). Rollback: ...-tier-l47 or FLASH_NEXT_PREFILL_INTERVAL=1.
+    # 2026-10-28: default -tier-l49 = l48b + local-48c (prompts with <= 4096 tokens left skip
+    # the prefill cadence hold: short-chat TTFT during a 200K prefill ~10 s -> ~0.6 s, costs the
+    # long prefill ~1 s per short request served, nothing otherwise) + local-49 (PLE n-gram table
+    # as INT8 rows, QEngine's ngram_int8.safetensors hardlinked into flash-next-ple, mlocked in
+    # RAM: 48.3 GiB vs 95.4 GiB BF16; NLL 1.6056 vs 1.6039, bench 132.0/163.6 vs 130.3/160.0,
+    # streams 128/247/270 vs 124/245/283, no disk reads). Needs ~48 GB free RAM, so the slug's
+    # KV_OFFLOAD_GB went 64 -> 48. Rollback: ...-tier-l48b, or FLASH_NEXT_PLE_INT8= (BF16) and
+    # FLASH_NEXT_PREFILL_SHORT=0.
+    # 2026-10-29: default -tier-l50 = l49 + local-50 with VLLM_QSA_CE_COPY=1 (QSA staging arena
+    # filled by copy engine + next layer's pages prefetched during the GDN layers): A/B at KV 643M,
+    # tier 32: 200K prefill 168 -> 119-123 s, 2-stream 143 -> 104 s, others' decode during it
+    # 33 -> 44-46 t/s, short TTFT p50 1.5-2.0 -> 0.6-0.7 s, 3 streams 269-278 -> 287-289, bench
+    # equal. Own row cache (FLASH_NEXT_QSA_ROWCACHE_MB) stays 0: 32 MiB gave nothing and cost
+    # 3-stream decode. Slug KV_OFFLOAD_GB 48 -> 40 (RAM). Rollback: FLASH_NEXT_QSA_CE_COPY=0 or ...-tier-l49.
+    # 2026-10-29: default -tier-l51 = l50 + local-51 (VLLM_QSA_BUCKET_PART=1: staged prefill
+    # tokens grouped by arena bucket once per layer). With chunk 1024: 200K+probe 75-83 ->
+    # 73.2-73.9 s, 200K 2-stream 68.7 -> 64.5-66.6 s, <=90K unchanged (one bucket); output
+    # within 1-2 bf16 ulp. Rollback: FLASH_NEXT_QSA_BUCKET_PART=0 or ...-tier-l50.
+    # 2026-10-29: default -tier-l52 = l51 + local-52 (FLASH_NEXT_WARMUP_SIZES: every linear layer
+    # runs once per prefill token-count bucket at boot, ~2.7 s per rank). Without it a first-seen
+    # batch shape loaded its humming GEMM module mid-serving and GPU 1 (driver-free ~1 MiB at
+    # peak with the 1024-token chunk) died in cuModuleLoadData (CUDA_ERROR_OUT_OF_MEMORY).
+    # Rollback: FLASH_NEXT_WARMUP_SIZES= (empty) or ...-tier-l51.
+    # 2026-10-29: default -tier-l53 = l52 + local-53 (MTP drafter bf16 linears as int8 copies for
+    # <= 16-row steps, Triton skinny GEMM for other bf16 linears at <= 16 rows, compact top-k/top-p
+    # in the recorded verify). Rig vs l52: bench 131.9/162.0 -> 141.3/172.9, 3 streams 282-292 ->
+    # 311-315 t/s, MTP acceptance ~2.3 -> 2.2-2.25 (drafts only). Rollback per switch
+    # (FLASH_NEXT_MTP_INT8_DENSE / FLASH_NEXT_SKINNY_BF16 / FLASH_NEXT_COMPACT_TOPK = 0) or ...-tier-l52.
+    # 2026-10-30 ~02:05: default -tier-l56 (l53 + skinny bf16 only for the hyper-connection
+    # block_inject GEMM, N=4 K=10240, where cuBLAS on sm_86 takes 73 us vs 7 us at 9 rows).
+    # vs l53 (skinny off): bench 134.1/163.6 -> 138.8/169.2, 3 streams ~291 -> ~304 t/s;
+    # quality two runs 127/135 and 134/138 (pass@1/pass@3; l49 132/138, l53 130/137).
+    # Rollback: FLASH_NEXT_SKINNY_BF16=0 (= l53 behaviour) or ...-tier-l53.
+    image: ${FLASH_NEXT_MTP_IMAGE:-flash-next-vllm-mtp:v031-fp8kv-series-l64}
+    # Built from the Dockerfile in the repository root when the tag is missing;
+    # never pulled. Rebuild after editing a patch: docker compose -f examples/compose.yml build
+    build:
+      context: ..
+    pull_policy: never
+    container_name: flash-next-vllm
+    restart: unless-stopped
+    # `vllm serve` plus vLLM's CPU KV tier (OffloadingConnector) when
+    # KV_OFFLOAD_GB is set. Off by default. Needs the -tier image (local-08):
+    # it carries the QSA host K/V with each block and lets the connector run
+    # with expandable_segments. Without it (2026-10-12) the allocator setting
+    # had to be dropped and the first long prefill OOMed GPU 1.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'if [ -n "$$KV_OFFLOAD_GB" ]; then set -- "$$@" --kv-offloading-size "$$KV_OFFLOAD_GB" --kv-offloading-backend native; fi; exec vllm serve "$$@"'
+      - vllm-serve
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:${PORT:-8000}:8000"
+    ipc: host
+    security_opt:
+      - label=disable
+    # SYS_PTRACE: without it the server still runs, with more CPU use on new
+    # prompts. SYS_NICE: docker also requires it for process_madvise (tested:
+    # SYS_PTRACE alone, even with seccomp=unconfined, gets EPERM).
+    cap_add:
+      - SYS_PTRACE
+      - SYS_NICE
+    # Required. Without it the server does not start (pinned KV host buffers).
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      # Three 24 GB GPUs (FLASH_NEXT_GPUS). PP=3 is sized for 3x24 GB; keep smaller
+      # cards out.
+      CUDA_VISIBLE_DEVICES: "${FLASH_NEXT_GPUS:-0,1,2}"
+      HF_HUB_OFFLINE: "1"
+      VLLM_NO_USAGE_STATS: "1"
+      # vLLM 0.31 (#57105) allocates the QSA indexer logits workspace at this cap
+      # on every prefill (0.30 sized it to the chunk). 512 (the default) OOMs
+      # PP1 in the profiling run with the MTP drafter on this rig; 256 only means
+      # smaller row chunks on long prefills. 128 since 2026-10-12: frees the
+      # ~128 MiB on GPU 1 that KV bytes 680000000 (2 x 262K at n=2) needs;
+      # prefill 10K/90K unchanged (3781/3202). 64 since 2026-10-29 with the 1024-token
+      # chunk: at 128 chunk 1024 OOMed GPU 1 allocating this workspace (103 MiB free).
+      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "${VLLM_SPARSE_INDEXER_MAX_LOGITS_MB:-64}"
+      # Kernel caches in ./cache next to this file (see volumes).
+      VLLM_CACHE_ROOT: /vllm-cache
+      TRITON_CACHE_DIR: /triton-cache
+
+      # Required. Do not change. The layer split makes room for the draft head
+      # on the last GPU.
+      VLLM_PP_LAYER_PARTITION: "16,17,15"
+      VLLM_PLE_MMAP_PATH: /ple/ngram_table.bin
+      # local-49 (-tier-l49+): map the INT8 table (QEngine format) instead of the BF16
+      # file (default since 2026-10-28). Set FLASH_NEXT_PLE_INT8= (empty) for BF16.
+      VLLM_PLE_INT8_PATH: "${FLASH_NEXT_PLE_INT8-/model/ple-int8/ngram_int8.safetensors}"
+      # local-49b: 1 = mlock the INT8 table in RAM (51.8 GB; needs that much free RAM).
+      VLLM_PLE_INT8_LOCK: "${FLASH_NEXT_PLE_INT8_LOCK:-1}"
+      VLLM_QSA_KV_OFFLOAD: "1"
+      # local-53 (-tier-l53+; all 1 by default since 2026-10-29, all 0 = l52): decode work on the last PP stage.
+      # MTP drafter's large bf16 linears as int8 copies for <= 16-row steps (drafts only).
+      VLLM_MTP_INT8_DENSE: "${FLASH_NEXT_MTP_INT8_DENSE:-1}"
+      # Other bf16 linears at <= 16 rows through the Triton skinny kernel.
+      # Off by default since 2026-10-29 evening: the all-on quality run lost pass@1 (6 packs 79 vs 85)
+      # and this is the only l53 switch that changes the target model's arithmetic.
+      VLLM_SKINNY_BF16: "${FLASH_NEXT_SKINNY_BF16:-1}"
+      # Recorded-verify top-k/top-p from per-block top-32 candidates (rows with top_k <= 32).
+      VLLM_COMPACT_TOPK: "${FLASH_NEXT_COMPACT_TOPK:-1}"
+      # local-59 (image -tier-l59): in_proj_ba on the aux stream under CUDA graphs; 0 = serial. Ignored by older images.
+      VLLM_GDN_BA_OVERLAP: "${FLASH_NEXT_GDN_BA_OVERLAP:-1}"
+      # local-61 (image -tier-l61, default since 2026-10-30): MTP weight-name prefilter at load,
+      # and QSA host KV pools without MADV_HUGEPAGE (0): with THP defrag=madvise the pinning stalled
+      # in direct compaction (init engine 186 s -> 78 s, same speed and greedy output); 1 = l59.
+      # Ignored by older images. The local-60 knobs below (HC 5-9 token kernel, MTP prompt
+      # KV-only) were rejected: no speed gain, the HC path changed greedy output. Their code is
+      # only in image -tier-l60; the defaults here are the off values.
+      VLLM_HC_FUSED_MAX_TOKENS: "${FLASH_NEXT_HC_FUSED_MAX:-4}"
+      VLLM_HC_ROWS_MIN_TOKENS: "${FLASH_NEXT_HC_ROWS_MIN:-5}"
+      VLLM_MTP_KV_ONLY_MIN_TOKENS: "${FLASH_NEXT_MTP_KV_ONLY_MIN:-0}"
+      VLLM_MTP_NAME_PREFILTER: "${FLASH_NEXT_MTP_NAME_PREFILTER:-1}"
+      VLLM_QSA_HOST_THP: "${FLASH_NEXT_QSA_HOST_THP:-0}"
+      # local-62 (image -tier-l62; ignored by older images): cap on waiting requests holding KV (default 3 since 2026-10-30)
+      # blocks for an async tier load (vllm#64628); 0 = no cap. Without it a burst of tier hits
+      # (a 16-question /v1/systemone) filled the 198-block pool and stalled the scheduler.
+      VLLM_MAX_NUM_INFLIGHT_KV_LOADS: "${FLASH_NEXT_MAX_INFLIGHT_KV_LOADS:-3}"
+      # local-63 (image -tier-l63 only; REJECTED 2026-10-30, no decision gain, GPU1 OOM at 9): running requests that will decode;
+      # prompt-only reads (/v1/systemone, /v1/decisions) use the rest of --max-num-seqs. 0 = off.
+      # Only with a larger FLASH_NEXT_MAX_SEQS, else max-num-seqs alone limits everything.
+      VLLM_MAX_DECODE_SEQS: "${FLASH_NEXT_MAX_DECODE_SEQS:-0}"
+      # local-64 (image -tier-l64, default since 2026-10-30): decision choice options past Z get
+      # two-letter labels (AA, AB, ...), up to 255 options; 0 = A-Z only (26). Ignored by older images.
+      VLLM_DECISION_PAIR_LABELS: "${FLASH_NEXT_DECISION_PAIR_LABELS:-1}"
+      # DIAGNOSTIC (-tier-l54 only): log skinny-vs-normal differences per bf16 linear at boot.
+      VLLM_SKINNY_VERIFY: "${FLASH_NEXT_SKINNY_VERIFY:-0}"
+      # local-55 (-tier-l55+): layer classes kept off the skinny bf16 path (MoE routers by default).
+      VLLM_SKINNY_SKIP: "${FLASH_NEXT_SKINNY_SKIP:-GateLinear}"
+      # local-56 (-tier-l56+): skinny bf16 only for weights with <= MAX_N rows and >= MIN_K
+      # inputs (0 = no bound). 8 / 8192 = only the hyper-connection block_inject GEMM.
+      VLLM_SKINNY_MAX_N: "${FLASH_NEXT_SKINNY_MAX_N:-8}"
+      VLLM_SKINNY_MIN_K: "${FLASH_NEXT_SKINNY_MIN_K:-8192}"
+      # local-52 (-tier-l52+): token counts for eager dummy forwards at boot, so every
+      # prefill-size GEMM kernel module loads before activations fill GPU 1. Set empty = off.
+      VLLM_EXTRA_WARMUP_SIZES: "${FLASH_NEXT_WARMUP_SIZES-1024,768,512,384,256,192,128,96,64,48,32,24,16,12,8,4,2,1}"
+      # DEBUG (-tier-l51dbg only): directory for the CUDA allocator history trigger files. Empty = off.
+      VLLM_MEM_HISTORY_DIR: "${FLASH_NEXT_MEM_HISTORY_DIR:-}"
+      # QSA prefill staging arena in bytes, rounded down to whole KV blocks (~9.8 MiB each);
+      # it also holds the decode row cache. 96 MiB (9 blocks) = the code default.
+      VLLM_QSA_KVO_ARENA: "${FLASH_NEXT_QSA_ARENA_BYTES:-100663296}"
+      # NCCL buffer per channel and peer for the PP send/recv (4 MiB = NCCL default).
+      NCCL_BUFFSIZE: "${FLASH_NEXT_NCCL_BUFFSIZE:-4194304}"
+      # 1 = NCCL's SHM transport (PP send/recv without GPU P2P) copies with cudaMemcpy (copy
+      # engine) instead of SM kernels. 0 = NCCL default.
+      NCCL_SHM_USE_CUDA_MEMCPY: "${FLASH_NEXT_NCCL_SHM_MEMCPY:-0}"
+      # local-50 (-tier-l50+; 0 and 0 = l49; CE 1 default since 2026-10-29): 1 = fill the QSA prefill staging arena by
+      # copy engine (cudaMemcpyAsync, 5.6 vs 2.0 GB/s on the rig's Gen3 x8, no SM slowdown)
+      # and copy the next QSA layer's leading pages while the GDN layers compute.
+      VLLM_QSA_CE_COPY: "${FLASH_NEXT_QSA_CE_COPY:-1}"
+      # local-50: MiB of VRAM for a decode row cache of its own (staged prefills stop
+      # dropping it; decode rows of a mixed prefill step use it). 0 = cache in the arena.
+      VLLM_QSA_ROW_CACHE_OWN_MB: "${FLASH_NEXT_QSA_ROWCACHE_MB:-0}"
+      # local-51 (-tier-l51+): 1 = group each row's selected tokens by arena bucket once,
+      # so a staged prefill above ~90K context walks each token once, not once per bucket.
+      VLLM_QSA_BUCKET_PART: "${FLASH_NEXT_QSA_BUCKET_PART:-1}"
+      # vLLM CPU KV tier in GiB (see entrypoint). Empty = off.
+      KV_OFFLOAD_GB: "${KV_OFFLOAD_GB:-40}"
+      # local-08 tier: state pool size relative to the attention pool. Every request
+      # stores 1 attention chunk + 1 state per Mamba group (19). At 4 the states ran out
+      # ~5x sooner than attention -> full tier misses (cold 90-180K re-prefill). 16
+      # (2026-10-25): pools [215, 3440]; 3 x 93K sessions after 90 short requests hit
+      # the tier (1.0 s) vs 0 hits (29 s) at 4; bench/verify unchanged.
+      VLLM_KV_OFFLOAD_STATE_POOL_WEIGHT: "${VLLM_KV_OFFLOAD_STATE_POOL_WEIGHT:-16}"
+      # Keep both. Without them, long prompts can run out of GPU memory.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+      # "1" only if the image was built without decode-01 and 02, together
+      # with "cudagraph_mode":"PIECEWISE" below.
+      VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+      # local-03 (same defaults as the no-MTP fp8 slug; A/B there 2026-10-07).
+      VLLM_MAMBA_IDX_STEP_CACHE: "${VLLM_MAMBA_IDX_STEP_CACHE:-1}"
+      VLLM_PLE_GATHER_ADVISE: "${VLLM_PLE_GATHER_ADVISE:-1}"
+
+      # Each patch can be turned off with "0" (see the patch headers).
+      # VLLM_PLE_PREFETCH: "0"
+      # VLLM_PP_DEFER_RECV: "0"
+      # VLLM_HC_FUSED_INT8: "0"
+      VLLM_MOE_FUSED_DECODE: "${VLLM_MOE_FUSED_DECODE:-1}"
+      # local-12 (-tier-l12 image): spread decodes over the PP microbatches.
+      VLLM_PP_DECODE_SPREAD: "${VLLM_PP_DECODE_SPREAD:-1}"
+      # local-48b: consecutive prefill steps per --prefill-schedule-interval (1 = #54627).
+      VLLM_PREFILL_CADENCE_BURST: "${FLASH_NEXT_PREFILL_BURST:-12}"
+      # local-57 (-tier-l57+): time-based cadence. Share in (0,1) = prefill keeps that share of the
+      # wall time in bursts of at most BURST_MS while decodes run; 0 = step-based (interval/burst).
+      VLLM_PREFILL_TIME_SHARE: "${FLASH_NEXT_PREFILL_TIME_SHARE:-0}"
+      VLLM_PREFILL_BURST_MS: "${FLASH_NEXT_PREFILL_BURST_MS:-1200}"
+      # local-58 (-tier-l58+): wall-time cap for a step-based burst; the decode hold after a capped
+      # burst is the interval scaled by the steps that ran. 0 = off.
+      VLLM_PREFILL_BURST_CAP_MS: "${FLASH_NEXT_PREFILL_BURST_CAP_MS:-0}"
+      # local-48c (-tier-l48c+): prompts with at most N tokens left to compute skip the
+      # prefill cadence hold and share the budget with a long chunk (0 = off).
+      VLLM_PREFILL_CADENCE_SHORT: "${FLASH_NEXT_PREFILL_SHORT:-4096}"
+      # local-16 (#52814): shm message-queue reader spin window in seconds; only
+      # images with local-16 read it (others ignore it). 1 = upstream default.
+      # Off since 2026-10-29: the -tier lineage has no local-16, so vLLM only warned
+      # "Unknown vLLM environment variable". Re-enable on a local-16 image.
+      # VLLM_SHM_BROADCAST_BUSY_LOOP_S: "${VLLM_SHM_BROADCAST_BUSY_LOOP_S:-1}"
+      # local-17 (#62748, -tier-l17 image): persistent pinned H2D staging + skip
+      # idle sampler flushes. 0 = the l15 code path; other images ignore it.
+      VLLM_PINNED_STAGING: "${VLLM_PINNED_STAGING:-0}"
+      # local-18 (-tier-l18 image): MTP draft-only vocab (INT8 sub-head, ~+102 MiB
+      # on GPU 2). 0 = full head; 1 = baked 40,960-id list; or a path to a list.
+      VLLM_MTP_DRAFT_VOCAB: "${VLLM_MTP_DRAFT_VOCAB:-/usr/local/lib/python3.12/dist-packages/vllm/models/qwen4_exp/nvidia/mtp_draft_vocab_ids_swift_id47104.json}"
+      # local-20 (#47686 port, -tier-l24+): one packed PP broadcast per step (0 = off).
+      VLLM_PP_PACKED_BCAST: "${VLLM_PP_PACKED_BCAST:-1}"
+      # local-21 (-tier-l21/-l23): decode attn metadata from recorded CUDA graphs (0 = off).
+      VLLM_CG_ATTN_META: "${VLLM_CG_ATTN_META:-1}"
+      # local-30 (-tier-l30+): drafter draft-step attn metadata from recorded CUDA graphs (0 = off).
+      VLLM_CG_DRAFT_META: "${VLLM_CG_DRAFT_META:-1}"
+      # local-34 (-tier-l34+): PLE decode madvise page dedupe / helper threads (0 / 1 = off).
+      VLLM_PLE_ADVISE_DEDUPE: "${VLLM_PLE_ADVISE_DEDUPE:-1}"
+      VLLM_PLE_ADVISE_THREADS: "${VLLM_PLE_ADVISE_THREADS:-3}"
+      VLLM_PLE_ADVISE_SPLIT_MIN: "${VLLM_PLE_ADVISE_SPLIT_MIN:-16}"
+      # local-35 (-tier-l36+): GPU n-gram lookup only while one request runs (0 = every 1-request batch).
+      VLLM_NGRAM_SINGLE_ONLY: "${VLLM_NGRAM_SINGLE_ONLY:-1}"
+      # local-37 (-tier-l37+): decode verify (sampling + rejection) from recorded CUDA graphs (0 = off).
+      VLLM_FAST_SAMPLE: "${VLLM_FAST_SAMPLE:-1}"
+      # local-42 (-tier-l42+): RecoverSSM under PP>1 is gated (1 = allow; only with
+      # FLASH_NEXT_REPLAYSSM=--use-replayssm). CG_META / COMMIT_CG = local-42 speed paths.
+      VLLM_RECOVERSSM_PP: "${VLLM_RECOVERSSM_PP:-1}"
+      VLLM_RECOVERSSM_CG_META: "${VLLM_RECOVERSSM_CG_META:-1}"
+      VLLM_RECOVERSSM_COMMIT_CG: "${VLLM_RECOVERSSM_COMMIT_CG:-1}"
+      # local-44 (-tier-l44+): deferred commit of non-last PP ranks from CUDA graphs (0 = clone + eager).
+      VLLM_RECOVERSSM_PP_CG: "${VLLM_RECOVERSSM_PP_CG:-1}"
+      # local-45 (-tier-l45+): GDN RecoverSSM metadata reused across groups (0 = l44); ALIGNED_IDX=1 shifts greedy output only via the MoE allocator-state drift (benign).
+      VLLM_RECOVERSSM_META_REUSE: "${VLLM_RECOVERSSM_META_REUSE:-1}"
+      VLLM_RECOVERSSM_ALIGNED_IDX: "${VLLM_RECOVERSSM_ALIGNED_IDX:-0}"
+      # VLLM_QSA_ROW_CACHE: "0"
+      # VLLM_VISION_HOST_STREAM: "0"
+      # VLLM_MTP_EMBED_ON_HOST: "0"     does not fit at these settings
+
+    volumes:
+      # The Hugging Face repository (all files, including ple-int8/).
+      - ${MODEL_DIR:?set MODEL_DIR to the downloaded model folder}:/model:ro
+      # Only used for the BF16 PLE table (FLASH_NEXT_PLE_INT8= empty): the loader builds
+      # ngram_table.bin (~100 GB) here. Mount a directory, not a file.
+      - ${PLE_DIR:-./ple}:/ple
+      - ./cache/vllm:/vllm-cache
+      - ./cache/triton:/triton-cache
+
+    command:
+      - --model
+      - /model
+      - --served-model-name
+      - Swift1.5-Qwen3.8-Flash-Next-Uncensored
+      # Split <think>...</think> into reasoning_content.
+      - --reasoning-parser
+      - qwen3
+      # Tool calling. The chat template emits the XML <tool_call><function=...>
+      # format; qwen3_coder parses it (qwen3_xml is the same class in 0.30).
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      # Raised 4 -> 16 (budi, 2026-09-27): agent clients resend the whole history,
+      # so images accumulate per request. The encoder profiles 1 image (2048-token
+      # budget) either way; each 2 MP image adds <= 2048 prompt tokens.
+      # For text only, replace these four lines with --language-model-only.
+      - --limit-mm-per-prompt
+      - '{"image":16,"video":0}'
+      - --mm-processor-kwargs
+      - '{"max_pixels":2097152}'
+      # Do not change. Tensor parallelism is not supported.
+      - --pipeline-parallel-size
+      - "3"
+      - --tensor-parallel-size
+      - "1"
+      # The draft head predicts 1 token; SPEC_N > 1 chains it. n-sweep 2026-10-12
+      # (v031+l07): n=2 best (126.8/157.0 vs n=1 122.0/137.2, n=3 121.3/166.5);
+      # saved as a slug setting (switch.sh --set ... SPEC_N=2).
+      - --speculative-config
+      # SPEC_EXTRA appends raw JSON fields. Default keeps the trailing block
+      # (and partial tail) of the QSA/MTP group on CPU-tier hits: a 121K revisit
+      # from the tier went 7.7 s -> 1.3 s, identical tokens, same MTP acceptance
+      # (2026-10-21). SPEC_EXTRA= (empty) restores upstream's block drop.
+      - '{"method":"mtp","num_speculative_tokens":${SPEC_N:-2}${SPEC_EXTRA-,"disable_eagle_block_drop":true,"ngram_lookup":true,"ngram_lookup_predict":true}}'
+      - --engram-config
+      - '{"cpu_offload":true}'
+      - --max-model-len
+      - "262144"
+      # FP8-e4m3 QSA main K/V (local-02), drafter layers included.
+      - --kv-cache-dtype
+      - fp8
+      # 4 was tried 2026-09-26 (with KV bytes raised to match): warmup OOM on
+      # GPU 1 at 24126/24576 MiB. Doesn't fit on 24 GB with the MTP head.
+      - --max-num-seqs
+      # 3 since 2026-10-21 (with local-12): total decode stays ~150 t/s, each
+      # of 3 streams ~51 t/s instead of a 3rd request waiting (2 seqs: ~73 each).
+      - "${FLASH_NEXT_MAX_SEQS:-3}"
+      # Admission headroom: a waiting or preempted request is admitted only if this
+      # fraction of the 240 KV blocks stays free afterwards (0 = vLLM default). Each
+      # request holds ~57 Mamba blocks + 2 per 9984 tokens, so 3 long sessions overfill
+      # the pool and the newest one gets preempted and recomputed over and over.
+      - --watermark
+      - "${FLASH_NEXT_WATERMARK:-0}"
+      # Prefill chunk. 1568: 470 MiB more VRAM, same speed. 256: prefill +32%.
+      # 1024 since 2026-10-29 (with the indexer logits workspace at 64 MiB, KV 643M,
+      # -tier-l50 CE copy): 10K 3.1 -> 2.4 s, 30K 8.5 -> 5.5 s, 90K 26 -> 16.5 s,
+      # 200K 124 -> 75-83 s, 250K 100 -> 62 s, decode and 3 streams unchanged;
+      # verify-stress 13/13 functional, but GPU 1 has ~5 MiB free at peak. Rollback: 512.
+      - --max-num-batched-tokens
+      - "${FLASH_NEXT_BATCHED_TOKENS:-1024}"
+      # Prefill chunk cap while more than one request is running or waiting (vLLM skips
+      # it for a lone request). With PP=3 a decode step crosses all 3 stages, so a
+      # 512-token prefill chunk at 200K context held decode at 2-6 t/s for ~2 min
+      # (2026-10-25). 0 = off (vLLM default).
+      - --long-prefill-token-threshold
+      - "${FLASH_NEXT_LONG_PREFILL:-0}"
+      # Prefill only every N executed steps while another request decodes (local-48 =
+      # #54627; a no-op on images before -tier-l48). 1 = every step (vLLM default); 96 since -tier-l48b.
+      - --prefill-schedule-interval
+      - "${FLASH_NEXT_PREFILL_INTERVAL:-96}"
+      # No effect on context while --kv-cache-memory-bytes is set.
+      # 0.95, not 0.97: Pinokio's ComfyUI holds ~400 MiB on GPUs 0-1 (2026-10-07).
+      - --gpu-memory-utilization
+      - "0.95"
+      # Same value as the bf16 MTP slug (2 x 262K, 41.2 GiB pinned there); with
+      # FP8 K/V the block count stays and the pinned pool roughly halves.
+      # 680000000 since 2026-10-12: n=2 (SPEC_N) cuts the pool from 524K to 426K
+      # tokens at 550000000; 680000000 gives 526,808 (2 x 262K, 25.9 GiB pinned
+      # host K/V). Needs the indexer cap at 128 or GPU 1 OOMs in warmup.
+      # 780000000 since 2026-10-26: 240 blocks (604,947 tokens, 29.7 GiB pinned) instead
+      # of 209. Each request holds ~57 Mamba blocks, so at 209 three ~70K+ agent sessions
+      # overfilled the pool and the newest was preempted and reloaded every few seconds.
+      # Rig: 3 parallel 91K sessions x 4 turns, 0 preemptions; verify 9/9; bench
+      # 133.6/166.1 (680M boot 136.1/169.9, boot-to-boot spread); VRAM 23650/24102/23872.
+      # 643200000 since 2026-10-28 (-tier-l49): 198 blocks = exactly 3 x 262K requests with
+      # RecoverSSM (19 Mamba + 47 attention blocks each); the 42 extra blocks of 780M only
+      # held GPU prefix cache and cost 5.2 GB of pinned host RAM (QSA host K/V 29.7 -> 24.5
+      # GB), which the mlocked INT8 PLE table needed. Rollback: FLASH_NEXT_KV_BYTES=780000000.
+      - --kv-cache-memory-bytes
+      - "${FLASH_NEXT_KV_BYTES:-643200000}"
+      # RecoverSSM (vllm#58863, local-42, -tier-l42+ only): one Mamba state slot per
+      # request instead of 1 + 2 drafts. ON by default since 2026-10-27 (-tier-l45);
+      # --no-use-replayssm turns it off (needed for images before -tier-l42).
+      - "${FLASH_NEXT_REPLAYSSM:---use-replayssm}"
+      # Do not change: the draft head needs align.
+      - --enable-prefix-caching
+      # Diagnostics slot: one extra argv element, e.g.
+      # FLASH_NEXT_DIAG_ARG='--profiler-config={"profiler":"torch","torch_profiler_dir":"/tmp/vprof"}'.
+      # Unset = a repeat of --enable-prefix-caching (no-op).
+      - "${FLASH_NEXT_DIAG_ARG:---enable-prefix-caching}"
+      - --mamba-cache-mode
+      - align
+      # Safe since local-04 (host-K/V copy-on-write) is in the image.
+      - --prefix-match-unit
+      - "16"
+      - --compilation-config
+      - '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":${FLASH_NEXT_CG_SIZES:-[3,6,9]}}'
+      # Inside the container; exposure is set by the `ports:` mapping above.
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"

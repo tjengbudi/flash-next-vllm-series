@@ -1,0 +1,200 @@
+diff -ruN a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py	2026-10-23 10:41:40.369206235 +0700
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py	2026-10-23 10:57:47.188690706 +0700
+@@ -57,6 +57,7 @@
+ )
+ from vllm.platforms import current_platform
+ from vllm.scalar_type import ScalarType, scalar_types
++from vllm.triton_utils import tl, triton
+ 
+ 
+ def _fused_marlin_moe(
+@@ -233,13 +234,17 @@
+ # deterministic. Graph-capturable (no host sync). VLLM_MARLIN_MOE_DET_ALIGN=0
+ # restores the upstream order.
+ _DET_ALIGN = os.environ.get("VLLM_MARLIN_MOE_DET_ALIGN", "1") != "0"
++# local-21e: VLLM_MARLIN_MOE_DET_ALIGN=torch selects the local-21c eager-torch
++# implementation below (~10 small launches); any other non-"0" value uses the
++# single Triton kernel that produces the identical sorted_token_ids.
++_DET_ALIGN_TORCH = os.environ.get("VLLM_MARLIN_MOE_DET_ALIGN", "1") == "torch"
+ # local-21d: only reorder calls with at least this many token rows. Decode steps
+ # (<= max_num_seqs * (1 + num_spec) = 9 rows here) skip the extra sort kernels,
+ # which cost ~5-7% at 2-3 streams; prefill chunks stay deterministic.
+ _DET_ALIGN_MIN_TOKENS = int(os.environ.get("VLLM_MARLIN_MOE_DET_ALIGN_MIN_TOKENS", "10"))
+ 
+ 
+-def _deterministic_expert_order(
++def _deterministic_expert_order_torch(
+     sorted_token_ids: torch.Tensor,
+     expert_ids: torch.Tensor,
+     num_tokens_post_padded: torch.Tensor,
+@@ -267,6 +272,169 @@
+     return out
+ 
+ 
++
++# local-21e: one-launch replacement for _deterministic_expert_order_torch.
++# One program per block_size slot of sorted_token_ids. A program whose block
++# holds valid entries (position < num_tokens_post_padded) finds its run (the
++# maximal stretch of consecutive blocks with the same expert_ids value, cut at
++# num_tokens_post_padded) and writes each of its entries to
++#   run_start + #{run entries with a smaller id, or an equal id earlier},
++# i.e. the stable sort of the run by token id. Positions at or past
++# num_tokens_post_padded (and the tail past n_blocks * block_size) are copied
++# unchanged, exactly like the torch version. Valid entries of a
++# moe_align_block_size output are in [0, topk_ids.numel()], so sorting by id
++# inside each run is the same order as the torch run*big+id key.
++@triton.jit(
++    do_not_specialize=["in_ptr", "out_ptr", "eid_ptr", "ntpp_ptr", "n", "n_blocks"]
++)
++def _det_expert_order_kernel(
++    in_ptr,
++    out_ptr,
++    eid_ptr,
++    ntpp_ptr,
++    n,
++    n_blocks,
++    BS: tl.constexpr,
++    BS_P2: tl.constexpr,
++    W: tl.constexpr,
++    CH: tl.constexpr,
++):
++    b = tl.program_id(0)
++    lane = tl.arange(0, BS_P2)
++    p = b * BS + lane
++    in_blk = (lane < BS) & (p < n)
++    vals = tl.load(in_ptr + p, mask=in_blk, other=0)
++
++    ntpp = tl.load(ntpp_ptr).to(tl.int32)
++    ntpp = tl.minimum(tl.maximum(ntpp, 0), n_blocks * BS)
++    valid_blk = b * BS < ntpp
++    nvb = (ntpp + BS - 1) // BS
++    eb = tl.load(eid_ptr + b, mask=valid_blk, other=0)
++    j = tl.arange(0, W)
++
++    # run start: walk back over blocks with the same expert id
++    s = b
++    go = valid_blk & (s > 0)
++    while go:
++        idx = s - 1 - j
++        ev = tl.load(eid_ptr + idx, mask=idx >= 0, other=0)
++        brk = (idx < 0) | (ev != eb)
++        first = tl.min(tl.where(brk, j, W), axis=0)
++        s = s - first
++        go = (first == W) & (s > 0)
++    # run end (exclusive), limited to blocks holding valid entries
++    t = b + 1
++    go = valid_blk & (t < nvb)
++    while go:
++        idx = t + j
++        ev = tl.load(eid_ptr + idx, mask=idx < nvb, other=0)
++        brk = (idx >= nvb) | (ev != eb)
++        first = tl.min(tl.where(brk, j, W), axis=0)
++        t = t + first
++        go = (first == W) & (t < nvb)
++
++    seg_lo = s * BS
++    seg_hi = tl.where(valid_blk, tl.minimum(t * BS, ntpp), seg_lo)
++    ranked = in_blk & (p < ntpp)
++    rank = tl.zeros([BS_P2], dtype=tl.int32)
++    q0 = tl.arange(0, CH)
++    for start in range(seg_lo, seg_hi, CH):
++        q = start + q0
++        mq = q < seg_hi
++        w = tl.load(in_ptr + q, mask=mq, other=0)
++        before = (w[None, :] < vals[:, None]) | (
++            (w[None, :] == vals[:, None]) & (q[None, :] < p[:, None])
++        )
++        rank += tl.sum((before & mq[None, :]).to(tl.int32), axis=1)
++    dst = tl.where(ranked, seg_lo + rank, p)
++    tl.store(out_ptr + dst, vals, mask=in_blk)
++
++
++# local-21e: after the first (JIT-dispatched) launch per (block_size, dtypes,
++# device) the compiled kernel is launched directly, skipping Triton's per-call
++# argument binding / specialization / cache-key work (~half the host cost on
++# the rig's slow vCPUs). No argument is specialized (see do_not_specialize), so
++# the cached binary is valid for every call with the same key. Any failure
++# falls back to the normal JIT launch. VLLM_MARLIN_MOE_DET_FAST_LAUNCH=0
++# always uses the JIT launch.
++_DET_FAST_LAUNCH = os.environ.get("VLLM_MARLIN_MOE_DET_FAST_LAUNCH", "1") != "0"
++_DET_KERNELS: dict = {}
++
++
++def _deterministic_expert_order(
++    sorted_token_ids: torch.Tensor,
++    expert_ids: torch.Tensor,
++    num_tokens_post_padded: torch.Tensor,
++    block_size: int,
++) -> torch.Tensor:
++    if _DET_ALIGN_TORCH:
++        return _deterministic_expert_order_torch(
++            sorted_token_ids, expert_ids, num_tokens_post_padded, block_size
++        )
++    n = sorted_token_ids.numel()
++    n_blocks = min(expert_ids.numel(), n // block_size)
++    if n_blocks == 0:
++        return sorted_token_ids
++    out = torch.empty_like(sorted_token_ids)
++    grid0 = (n + block_size - 1) // block_size
++    dev = sorted_token_ids.device
++    key = (
++        block_size,
++        sorted_token_ids.dtype,
++        expert_ids.dtype,
++        num_tokens_post_padded.dtype,
++        dev,
++    )
++    ck = _DET_KERNELS.get(key) if _DET_FAST_LAUNCH else None
++    if ck is not None:
++        args = (
++            sorted_token_ids,
++            out,
++            expert_ids,
++            num_tokens_post_padded,
++            n,
++            n_blocks,
++            block_size,
++            ck.det_bs_p2,
++            32,
++            64,
++        )
++        try:
++            stream = torch._C._cuda_getCurrentRawStream(dev.index)
++            ck.run(
++                grid0,
++                1,
++                1,
++                stream,
++                ck.function,
++                ck.packed_metadata,
++                ck.launch_metadata((grid0, 1, 1), stream, *args),
++                triton.knobs.runtime.launch_enter_hook,
++                triton.knobs.runtime.launch_exit_hook,
++                *args,
++            )
++            return out
++        except Exception:
++            _DET_KERNELS.pop(key, None)
++    bs_p2 = triton.next_power_of_2(block_size)
++    ck = _det_expert_order_kernel[(grid0,)](
++        sorted_token_ids,
++        out,
++        expert_ids,
++        num_tokens_post_padded,
++        n,
++        n_blocks,
++        BS=block_size,
++        BS_P2=bs_p2,
++        W=32,
++        CH=64,
++        num_warps=2,
++    )
++    if _DET_FAST_LAUNCH and ck is not None and hasattr(ck, "run"):
++        ck.det_bs_p2 = bs_p2
++        _DET_KERNELS[key] = ck
++    return out
++
+ def fused_marlin_moe(
+     hidden_states: torch.Tensor,
+     w1: torch.Tensor,

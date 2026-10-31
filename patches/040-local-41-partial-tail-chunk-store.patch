@@ -1,0 +1,19 @@
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -1182,7 +1182,15 @@
+             # request-level, next_stored_chunk_idx stays at 0 so all
+             # chunks (including hits) are offloaded.
+             if req_status.offloading_context.policy == OffloadPolicy.CHUNK_LEVEL:
+-                group_state.next_stored_chunk_idx = num_chunks
++                # local-41: a chunk loaded only up to a partial-tail boundary is
++                # not offloaded as a full chunk yet (it was loaded through its
++                # boundary key, see end_chunk_idx). Counting it as stored meant it
++                # was never stored once this request filled it, so every later
++                # turn of the session stopped at this old tail and recomputed the
++                # rest.
++                group_state.next_stored_chunk_idx = num_chunks - (
++                    partial_tail_boundary is not None
++                )
+ 
+         src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
+         dst_spec = GPULoadStoreSpec(

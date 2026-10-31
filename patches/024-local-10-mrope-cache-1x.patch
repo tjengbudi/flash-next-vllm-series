@@ -1,0 +1,317 @@
+local-10: M-RoPE cos/sin cache sized like plain RoPE (vLLM #59853, in v0.32.0)
+
+Qwen3.8 built its M-RoPE cache at 4x max_position_embeddings (headroom only
+video pruning needs; video is off on these slugs). Measured on sm_86 with the
+Swift config (rotary dim 64, 262,144 positions): cache held per GPU 128 -> 32 MiB,
+build peak 644 -> 161 MiB, first 262,144 rows bit-exact. Upstream diff as-is
+except the qwen4_exp qsa.py import hunk, re-anchored for the patched tree.
+Drop when the image moves to vLLM >= 0.32.
+
+diff -ruN a/vllm/config/model.py b/vllm/config/model.py
+--- a/vllm/config/model.py	2026-10-21 17:21:49.010336044 +0700
++++ b/vllm/config/model.py	2026-10-21 17:21:49.013336040 +0700
+@@ -477,6 +477,10 @@
+         # here early.
+         if self.multimodal_config:
+             factors["language_model_only"] = self.multimodal_config.language_model_only
++            # Sizes Qwen3.5's M-RoPE cache.
++            factors["video_pruning"] = (
++                self.multimodal_config.is_multimodal_pruning_enabled()
++            )
+         return hash_factors(factors)
+ 
+     def _update_nested(
+diff -ruN a/vllm/model_executor/layers/rotary_embedding/__init__.py b/vllm/model_executor/layers/rotary_embedding/__init__.py
+--- a/vllm/model_executor/layers/rotary_embedding/__init__.py	2026-10-21 17:21:49.101335919 +0700
++++ b/vllm/model_executor/layers/rotary_embedding/__init__.py	2026-10-21 17:21:49.104335915 +0700
+@@ -36,6 +36,7 @@
+     rope_parameters: dict[str, Any] | None = None,
+     dtype: torch.dtype | None = None,
+     dual_chunk_attention_config: dict[str, Any] | None = None,
++    mrope_positions_factor: int = 4,
+ ) -> RotaryEmbedding:
+     if dtype is None:
+         dtype = torch.get_default_dtype()
+@@ -78,6 +79,7 @@
+         rope_parameters_args,
+         dual_chunk_attention_args,
+         dtype,
++        mrope_positions_factor,
+     )
+     if key in _ROPE_DICT:
+         return _ROPE_DICT[key]
+@@ -118,6 +120,7 @@
+                 dtype,
+                 mrope_section=rope_parameters["mrope_section"],
+                 mrope_interleaved=rope_parameters.get("mrope_interleaved", False),
++                positions_factor=mrope_positions_factor,
+             )
+         elif "use_fope" in rope_parameters and rope_parameters["use_fope"]:
+             extra_kwargs = {
+@@ -263,6 +266,7 @@
+                 dtype,
+                 mrope_section=rope_parameters["mrope_section"],
+                 mrope_interleaved=rope_parameters.get("mrope_interleaved", False),
++                positions_factor=mrope_positions_factor,
+                 scaling_factor=scaling_factor,
+                 **extra_kwargs,
+             )
+diff -ruN a/vllm/model_executor/layers/rotary_embedding/mrope.py b/vllm/model_executor/layers/rotary_embedding/mrope.py
+--- a/vllm/model_executor/layers/rotary_embedding/mrope.py	2026-10-21 17:21:49.090335934 +0700
++++ b/vllm/model_executor/layers/rotary_embedding/mrope.py	2026-10-21 17:21:49.092335932 +0700
+@@ -315,8 +315,9 @@
+         dtype: torch.dtype,
+         mrope_section: list[int] | None = None,
+         mrope_interleaved: bool = False,
+-        # YaRN parameters.
+         *,
++        positions_factor: int = 4,
++        # YaRN parameters.
+         scaling_factor: float | None = None,
+         beta_fast: int = 32,
+         beta_slow: int = 1,
+@@ -345,8 +346,9 @@
+ 
+         # In Qwen2.5-VL, the maximum index value is related to the duration of
+         # the input video. We enlarge max_position_embeddings to 4 times to get
+-        # a larger the cos and sin cache.
+-        self.cache_max_position_num = max_position_embeddings * 4
++        # a larger the cos and sin cache. Models whose positions never exceed
++        # the token count pass `positions_factor=1`.
++        self.cache_max_position_num = max_position_embeddings * positions_factor
+         super().__init__(
+             head_size,
+             rotary_dim,
+diff -ruN a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+--- a/vllm/model_executor/models/qwen3_5.py	2026-10-21 17:21:49.033336013 +0700
++++ b/vllm/model_executor/models/qwen3_5.py	2026-10-21 17:21:49.036336009 +0700
+@@ -89,6 +89,7 @@
+     Qwen3VLForConditionalGeneration,
+     Qwen3VLMultiModalProcessor,
+     Qwen3VLProcessingInfo,
++    mrope_positions_factor,
+ )
+ from .utils import (
+     AutoWeightsLoader,
+@@ -159,6 +160,7 @@
+                 quant_config=quant_config,
+                 prefix=f"{prefix}.self_attn",
+                 reduce_results=not self.use_attn_reduce_scatter_for_moe,
++                mrope_positions_factor=mrope_positions_factor(vllm_config),
+             )
+         else:
+             raise ValueError(f"Invalid layer_type {self.layer_type}")
+diff -ruN a/vllm/model_executor/models/qwen3_moe.py b/vllm/model_executor/models/qwen3_moe.py
+--- a/vllm/model_executor/models/qwen3_moe.py	2026-10-21 17:21:49.067335966 +0700
++++ b/vllm/model_executor/models/qwen3_moe.py	2026-10-21 17:21:49.069335963 +0700
+@@ -256,6 +256,7 @@
+         quant_config: QuantizationConfig | None = None,
+         prefix: str = "",
+         dual_chunk_attention_config: dict[str, Any] | None = None,
++        mrope_positions_factor: int = 4,
+     ) -> None:
+         super().__init__()
+         self.hidden_size = hidden_size
+@@ -303,6 +304,7 @@
+             max_position=max_position_embeddings,
+             rope_parameters=rope_parameters,
+             dual_chunk_attention_config=dual_chunk_attention_config,
++            mrope_positions_factor=mrope_positions_factor,
+         )
+         attention_kwargs: dict[str, Any] = {}
+         if dual_chunk_attention_config:
+@@ -351,6 +353,7 @@
+         vllm_config: VllmConfig,
+         prefix: str = "",
+         is_fused_checkpoint_transposed: bool = False,
++        mrope_positions_factor: int = 4,
+     ) -> None:
+         super().__init__()
+ 
+@@ -376,6 +379,7 @@
+             quant_config=quant_config,
+             prefix=f"{prefix}.self_attn",
+             dual_chunk_attention_config=dual_chunk_attention_config,
++            mrope_positions_factor=mrope_positions_factor,
+         )
+ 
+         # `mlp_only_layers` in the config.
+diff -ruN a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
+--- a/vllm/model_executor/models/qwen3_next.py	2026-10-21 17:21:49.022336028 +0700
++++ b/vllm/model_executor/models/qwen3_next.py	2026-10-21 17:21:49.024336025 +0700
+@@ -279,6 +279,7 @@
+         quant_config: QuantizationConfig | None = None,
+         reduce_results: bool = True,
+         prefix: str = "",
++        mrope_positions_factor: int = 4,
+     ) -> None:
+         super().__init__()
+         self.config = config
+@@ -330,6 +331,7 @@
+             max_position=config.max_position_embeddings,
+             rope_parameters=config.rope_parameters,
+             dual_chunk_attention_config=self.dual_chunk_attention_config,
++            mrope_positions_factor=mrope_positions_factor,
+         )
+ 
+         # Late-interaction retrieval models (e.g. ColQwen3.5) run BIDIRECTIONAL
+diff -ruN a/vllm/model_executor/models/qwen3.py b/vllm/model_executor/models/qwen3.py
+--- a/vllm/model_executor/models/qwen3.py	2026-10-21 17:21:49.045335996 +0700
++++ b/vllm/model_executor/models/qwen3.py	2026-10-21 17:21:49.047335994 +0700
+@@ -79,6 +79,7 @@
+         attn_type: str = AttentionType.DECODER,
+         dual_chunk_attention_config: dict[str, Any] | None = None,
+         per_layer_sliding_window: int | None = None,
++        mrope_positions_factor: int = 4,
+     ) -> None:
+         super().__init__()
+         self.hidden_size = hidden_size
+@@ -124,6 +125,7 @@
+             max_position=max_position,
+             rope_parameters=rope_parameters,
+             dual_chunk_attention_config=dual_chunk_attention_config,
++            mrope_positions_factor=mrope_positions_factor,
+         )
+         attn_cls = (
+             EncoderOnlyAttention
+@@ -179,6 +181,7 @@
+         quant_config: QuantizationConfig | None = None,
+         prefix: str = "",
+         per_layer_sliding_window: int | None = None,
++        mrope_positions_factor: int = 4,
+     ) -> None:
+         super().__init__()
+         self.hidden_size = config.hidden_size
+@@ -211,6 +214,7 @@
+             attn_type=attn_type,
+             dual_chunk_attention_config=dual_chunk_attention_config,
+             per_layer_sliding_window=per_layer_sliding_window,
++            mrope_positions_factor=mrope_positions_factor,
+         )
+         self.mlp = Qwen3MLP(
+             hidden_size=self.hidden_size,
+@@ -263,9 +267,13 @@
+     }
+ )
+ class Qwen3Model(Qwen2Model):
++    decoder_layer_type: type[nn.Module] = Qwen3DecoderLayer
++
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__(
+-            vllm_config=vllm_config, prefix=prefix, decoder_layer_type=Qwen3DecoderLayer
++            vllm_config=vllm_config,
++            prefix=prefix,
++            decoder_layer_type=self.decoder_layer_type,
+         )
+ 
+ 
+diff -ruN a/vllm/model_executor/models/qwen3_vl_moe.py b/vllm/model_executor/models/qwen3_vl_moe.py
+--- a/vllm/model_executor/models/qwen3_vl_moe.py	2026-10-21 17:21:49.056335981 +0700
++++ b/vllm/model_executor/models/qwen3_vl_moe.py	2026-10-21 17:21:49.058335978 +0700
+@@ -55,6 +55,7 @@
+     Qwen3VLForConditionalGeneration,
+     Qwen3VLMultiModalProcessor,
+     Qwen3VLProcessingInfo,
++    mrope_positions_factor,
+ )
+ from .utils import StageMissingLayer, maybe_prefix
+ 
+@@ -72,6 +73,7 @@
+             vllm_config=vllm_config,
+             prefix=prefix,
+             is_fused_checkpoint_transposed=True,
++            mrope_positions_factor=mrope_positions_factor(vllm_config),
+         )
+ 
+ 
+diff -ruN a/vllm/model_executor/models/qwen3_vl.py b/vllm/model_executor/models/qwen3_vl.py
+--- a/vllm/model_executor/models/qwen3_vl.py	2026-10-21 17:21:49.078335951 +0700
++++ b/vllm/model_executor/models/qwen3_vl.py	2026-10-21 17:21:49.081335947 +0700
+@@ -52,7 +52,7 @@
+     should_torch_compile_mm_encoder,
+     support_torch_compile,
+ )
+-from vllm.config import VllmConfig
++from vllm.config import VllmConfig, get_current_vllm_config
+ from vllm.config.multimodal import (
+     MultiModalConfig,
+     MultiModalDummyOptions,
+@@ -144,7 +144,7 @@
+     Qwen2VLProcessingInfo,
+     _create_qwen2vl_field_factory,
+ )
+-from .qwen3 import Qwen3ForCausalLM, Qwen3Model
++from .qwen3 import Qwen3DecoderLayer, Qwen3ForCausalLM, Qwen3Model
+ from .utils import (
+     AutoWeightsLoader,
+     PPMissingLayer,
+@@ -1685,6 +1685,22 @@
+         return PromptUpdateDetails.from_seq(all_token_ids)
+ 
+ 
++def mrope_positions_factor(vllm_config: VllmConfig) -> int:
++    # Video pruning keeps the positions of the tokens it drops. A drafter gets
++    # the target's positions, so it follows the target.
++    spec = vllm_config.speculative_config
++    model_config = (spec and spec.target_model_config) or vllm_config.model_config
++    mm_config = model_config.multimodal_config
++    pruned = mm_config is not None and mm_config.is_multimodal_pruning_enabled()
++    return 4 if pruned else 1
++
++
++class Qwen3VLDecoderLayer(Qwen3DecoderLayer):
++    def __init__(self, **kwargs) -> None:
++        factor = mrope_positions_factor(get_current_vllm_config())
++        super().__init__(**kwargs, mrope_positions_factor=factor)
++
++
+ @support_torch_compile(
+     dynamic_arg_dims={
+         "input_ids": 0,
+@@ -1698,6 +1714,8 @@
+     }
+ )
+ class Qwen3LLMModel(Qwen3Model):
++    decoder_layer_type = Qwen3VLDecoderLayer
++
+     def forward(
+         self,
+         input_ids: torch.Tensor | None,
+diff -ruN a/vllm/models/qwen4_exp/amd/qsa.py b/vllm/models/qwen4_exp/amd/qsa.py
+--- a/vllm/models/qwen4_exp/amd/qsa.py	2026-10-21 17:21:49.113335903 +0700
++++ b/vllm/models/qwen4_exp/amd/qsa.py	2026-10-21 17:21:49.115335900 +0700
+@@ -22,6 +22,7 @@
+ from vllm.model_executor.layers.quantization import QuantizationConfig
+ from vllm.model_executor.layers.rotary_embedding import get_rope
+ from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
++from vllm.model_executor.models.qwen3_vl import mrope_positions_factor
+ from vllm.platforms import current_platform
+ from vllm.transformers_utils.configs.qwen4_exp import (
+     Qwen4ExpTextConfig,
+@@ -250,6 +251,7 @@
+             head_size=self.head_dim,
+             max_position=config.max_position_embeddings,
+             rope_parameters=config.rope_parameters,
++            mrope_positions_factor=mrope_positions_factor(vllm_config),
+         )
+         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+diff -ruN a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py	2026-10-21 17:21:49.124335888 +0700
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py	2026-10-21 17:21:49.126335885 +0700
+@@ -24,6 +24,7 @@
+ from vllm.model_executor.layers.quantization import QuantizationConfig
+ from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding, get_rope
+ from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
++from vllm.model_executor.models.qwen3_vl import mrope_positions_factor
+ from vllm.platforms import current_platform
+ from vllm.platforms.interface import DeviceCapability
+ from vllm.transformers_utils.configs.qwen4_exp import (
+@@ -666,6 +667,7 @@
+             head_size=self.head_dim,
+             max_position=config.max_position_embeddings,
+             rope_parameters=config.rope_parameters,
++            mrope_positions_factor=mrope_positions_factor(vllm_config),
+         )
+         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)

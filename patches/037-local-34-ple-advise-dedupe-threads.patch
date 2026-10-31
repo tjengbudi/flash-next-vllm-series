@@ -1,0 +1,170 @@
+diff -ru a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+@@ -611,6 +611,28 @@
+ # process_madvise per decode step (~1.9 ms/token on the critical PP0 rank of
+ # the ESXi VM); with enough page cache the PLE rows are mostly resident anyway.
+ _PLE_GATHER_ADVISE = os.environ.get("VLLM_PLE_GATHER_ADVISE", "1").strip() not in ("", "0")
++# local-34: cheaper advise_now on the decode path (PP rank 0's critical path,
++# between the D2H wait for the ids and np.take).
++#   VLLM_PLE_ADVISE_DEDUPE=1: one iovec for each row's first page, plus one for
++#     its last page only when the row crosses a page boundary (~6% of the
++#     320-byte rows), instead of always two. Same page set, ~half the iovecs.
++#   VLLM_PLE_ADVISE_THREADS=N (> 1): split the iovecs over the calling thread
++#     plus N-1 persistent helper threads (the ctypes syscall releases the GIL),
++#     only when every part gets at least VLLM_PLE_ADVISE_SPLIT_MIN iovecs.
++#     Pays off on cold rows, where each WILLNEED page starts a read.
++# Both unset/0/1: the l30 code path, byte for byte the same syscall.
++_PLE_ADVISE_DEDUPE = os.environ.get("VLLM_PLE_ADVISE_DEDUPE", "0").strip() not in ("", "0")
++
++
++def _ple_env_int(name: str, default: int, lo: int) -> int:
++    try:
++        return max(lo, int(os.environ.get(name, str(default)).strip() or default))
++    except ValueError:
++        return default
++
++
++_PLE_ADVISE_THREADS = _ple_env_int("VLLM_PLE_ADVISE_THREADS", 1, 1)
++_PLE_ADVISE_SPLIT_MIN = _ple_env_int("VLLM_PLE_ADVISE_SPLIT_MIN", 16, 1)
+ _PLE_PREFETCH_BATCH_ENV = "VLLM_PLE_PREFETCH_BATCH"  # tokens per advise batch
+ 
+ 
+@@ -651,6 +673,43 @@
+         return mixed % sizes + offsets
+ 
+ 
++class _PLEAdviseHelpers:
++    """local-34: persistent threads that run one process_madvise each.
++
++    submit(i, addr, count) hands helper ``i`` an iovec slice; its return code
++    arrives on ``done``. The threads block on their queue between calls and
++    hold the GIL only around the ctypes call, which releases it.
++    """
++
++    def __init__(self, libc, pidfd: int, sys_nr: int, advice: int):
++        self.done: "queue.SimpleQueue[int]" = queue.SimpleQueue()
++        self._queues: list[queue.SimpleQueue] = []
++        self._args = (libc, pidfd, sys_nr, advice)
++
++    def ensure(self, num: int) -> None:
++        """Start helpers until there are ``num``."""
++        while len(self._queues) < num:
++            q: queue.SimpleQueue = queue.SimpleQueue()
++            self._queues.append(q)
++            threading.Thread(
++                target=self._run, args=(q, *self._args),
++                name=f"ple-advise-{len(self._queues)}", daemon=True,
++            ).start()
++
++    def submit(self, i: int, addr: int, count: int) -> None:
++        self._queues[i].put((addr, count))
++
++    def _run(self, q, libc, pidfd: int, sys_nr: int, advice: int) -> None:
++        done = self.done
++        while True:
++            addr, count = q.get()
++            try:
++                rc = libc.syscall(sys_nr, pidfd, ctypes.c_void_p(addr), count, advice, 0)
++            except Exception:  # never leave advise_now waiting
++                rc = -1
++            done.put(rc)
++
++
+ class _PLEPagePrefetcher:
+     """Background thread that loads a request's PLE pages into the page cache.
+ 
+@@ -684,6 +743,9 @@
+         self._libc.madvise.restype = ctypes.c_int
+         self._pidfd = -1
+         self._iov_now: "np.ndarray | None" = None
++        # local-34: helper threads for advise_now, started on first use.
++        self._helpers: "_PLEAdviseHelpers | None" = None
++        self._split_off = False
+         self._batched = self._probe_process_madvise()
+         self._lock = threading.Lock()
+         self._inflight: dict[str, int] = {}     # req_id -> job token
+@@ -737,6 +799,8 @@
+         The decode-path variant of ``_advise``: one process_madvise call over
+         the first and last page of every row, duplicates included (the kernel
+         skips resident pages quickly), with a preallocated iovec array.
++        local-34 (VLLM_PLE_ADVISE_DEDUPE / VLLM_PLE_ADVISE_THREADS): fewer
++        iovecs for the same pages, optionally split over helper threads.
+         """
+         n = rows.size
+         if not self._batched or 2 * n > self._IOV_MAX:
+@@ -749,15 +813,69 @@
+         offs = rows.astype(np.uint64, copy=False) * np.uint64(self._row_bytes)
+         mask = np.uint64(~((1 << self._PAGE_SHIFT) - 1) & 0xFFFFFFFFFFFFFFFF)
+         base = np.uint64(self._base)
+-        iov[:n, 0] = (offs & mask) + base
+-        iov[n : 2 * n, 0] = ((offs + np.uint64(self._row_bytes - 1)) & mask) + base
+-        rc = self._libc.syscall(
+-            self._SYS_PROCESS_MADVISE, self._pidfd,
+-            ctypes.c_void_p(iov.ctypes.data), 2 * n, self._MADV_WILLNEED, 0,
++        if _PLE_ADVISE_DEDUPE:
++            # local-34: the last page only for rows that cross a page boundary.
++            first = offs & mask
++            iov[:n, 0] = first + base
++            last = (offs + np.uint64(self._row_bytes - 1)) & mask
++            cross = last != first
++            extra = int(np.count_nonzero(cross))
++            if extra:
++                iov[n : n + extra, 0] = last[cross] + base
++            count = n + extra
++        else:
++            iov[:n, 0] = (offs & mask) + base
++            iov[n : 2 * n, 0] = ((offs + np.uint64(self._row_bytes - 1)) & mask) + base
++            count = 2 * n
++        parts = (
++            min(_PLE_ADVISE_THREADS, count // _PLE_ADVISE_SPLIT_MIN)
++            if _PLE_ADVISE_THREADS > 1 and not self._split_off
++            else 1
+         )
++        if parts > 1:
++            rc = self._advise_split(iov, count, parts)
++        else:
++            rc = self._libc.syscall(
++                self._SYS_PROCESS_MADVISE, self._pidfd,
++                ctypes.c_void_p(iov.ctypes.data), count, self._MADV_WILLNEED, 0,
++            )
+         if rc < 0:
+             self._batched = False
+ 
++    def _advise_split(self, iov: np.ndarray, count: int, parts: int) -> int:
++        """local-34: advise ``iov[:count]`` in ``parts`` contiguous slices, the
++        first on the calling thread and the others on helper threads; wait for
++        all of them. Returns the lowest return code."""
++        helpers = self._helpers
++        if helpers is None:
++            helpers = self._helpers = _PLEAdviseHelpers(
++                self._libc, self._pidfd, self._SYS_PROCESS_MADVISE,
++                self._MADV_WILLNEED,
++            )
++        helpers.ensure(parts - 1)
++        addr = iov.ctypes.data
++        stride = iov.strides[0]
++        bounds = [count * i // parts for i in range(parts + 1)]
++        for i in range(1, parts):
++            helpers.submit(
++                i - 1, addr + bounds[i] * stride, bounds[i + 1] - bounds[i]
++            )
++        rc = self._libc.syscall(
++            self._SYS_PROCESS_MADVISE, self._pidfd,
++            ctypes.c_void_p(addr), bounds[1], self._MADV_WILLNEED, 0,
++        )
++        for _ in range(1, parts):
++            try:
++                r = helpers.done.get(timeout=1.0)
++            except queue.Empty:
++                # A helper is stuck: stop splitting (late results are ignored).
++                logger.warning("PLE advise helper timed out; advise_now stops splitting")
++                self._split_off = True
++                return rc
++            if r < rc:
++                rc = r
++        return rc
++
+     def _advise(self, rows: np.ndarray) -> None:
+         shift = self._PAGE_SHIFT
+         offsets = rows * self._row_bytes

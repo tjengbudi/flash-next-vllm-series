@@ -1,0 +1,180 @@
+If you would like to merge this patch upstream, I would appreciate it if you could keep me credited as the commit author, or add the following trailer to the commit message: 
+
+Co-authored-by: Minachist <84688797+aiueonicked@users.noreply.github.com>
+
+Qwen3.8-Flash-Next vision patch 01: vision tower on the first rank, streamed from host.
+
+vllm/models/qwen4_exp/nvidia/model.py
+
+Needs flash-next-mem-01-pp-embed-head.patch for the memory it frees.
+
+Without --language-model-only the vision tower (27 blocks, 0.836 GiB BF16) was
+built on every pipeline rank, although vLLM runs the encoder on the first rank
+only. It is now built there only.
+
+The tower is built and loaded on the host and moved to the GPU by
+process_weights_after_loading(), after the MoE repacks have run: the first
+rank has no room for it on top of their load-time transients.
+
+With VLLM_VISION_HOST_STREAM=1 (the default) only the patch embedding, the
+position embedding and the merger go to the GPU. The 27 blocks stay in pinned
+host memory, and each block is copied into one of two GPU slots (58 MiB) just
+before it runs, the next one on a side stream while the current one computes.
+A block's weights take 1.16 ms to cross PCIe 4.0 x16 (26 GB/s); computing it
+takes about 4 ms for a 1 MP image, so only the first copy shows: the tower
+takes 111.7 ms instead of 109.5 ms for a 1 MP image and 295.5 instead of
+293.1 ms for 2 MP. Below ~0.4 MP the copies dominate, at most ~12 ms per image.
+
+On 3 x RTX 3090 this keeps the text-only KV cache (262,144 x 4) with vision
+on. VLLM_VISION_HOST_STREAM=0 keeps the whole tower on the GPU instead, which
+then needs --kv-cache-memory-bytes lowered to about 480000000 (262,144 x 2.44).
+
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index 2f18a73..91c5117 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -1511,6 +1511,91 @@ class Qwen4ExpForCausalLM(
+         return loader.load_weights(weights, mapper=mapper)
+ 
+ 
++class _HostStreamedBlocks:
++    """Keep the ViT blocks in pinned host memory and stage each block into
++    one of two GPU slots just before it runs, prefetching the next block on a
++    side stream. Everything outside ``blocks`` (patch/pos embed, merger) moves
++    to the GPU. Resident cost is two blocks instead of the whole tower."""
++
++    def __init__(
++        self, tower: nn.Module, blocks: nn.ModuleList, device: torch.device
++    ) -> None:
++        block_ids = {id(p) for p in blocks.parameters()}
++        for p in tower.parameters():
++            if id(p) not in block_ids:
++                p.data = p.data.to(device)
++        for b in tower.buffers():
++            b.data = b.data.to(device)
++
++        self.blocks = list(blocks)
++        self.params: list[list[nn.Parameter]] = []
++        self.host: list[list[torch.Tensor]] = []
++        numel = 0
++        dtype = None
++        for blk in self.blocks:
++            ps = list(blk.parameters())
++            self.params.append(ps)
++            self.host.append([p.data.contiguous().pin_memory() for p in ps])
++            for p, h in zip(ps, self.host[-1]):
++                p.data = h
++            numel = max(numel, sum(p.numel() for p in ps))
++            dt = {p.dtype for p in ps}
++            assert len(dt) == 1, dt
++            dtype = dt.pop() if dtype is None else dtype
++        self.slots = [torch.empty(numel, dtype=dtype, device=device) for _ in range(2)]
++        self.copy_stream = torch.cuda.Stream(device)
++        self.copied = [torch.cuda.Event() for _ in range(2)]
++        self.done = [torch.cuda.Event() for _ in range(2)]
++        # The blocks are @support_torch_compile modules whose __call__ goes
++        # straight to self.forward, so nn.Module hooks never fire; wrap
++        # forward on the instance instead.
++        for i, blk in enumerate(self.blocks):
++            blk.forward = self._wrap(i, blk.forward)
++        logger.info(
++            "ViT blocks streamed from host: %d blocks, %.1f MiB resident slots",
++            len(self.blocks),
++            2 * numel * self.slots[0].element_size() / 2**20,
++        )
++
++    def _stage(self, i: int) -> None:
++        slot = i % 2
++        with torch.cuda.stream(self.copy_stream):
++            self.copy_stream.wait_event(self.done[slot])
++            off = 0
++            for h in self.host[i]:
++                n = h.numel()
++                self.slots[slot][off : off + n].view_as(h).copy_(h, non_blocking=True)
++                off += n
++            self.copied[slot].record(self.copy_stream)
++
++    def _wrap(self, i: int, forward):
++        def wrapped(*args, **kwargs):
++            self._pre(i)
++            out = forward(*args, **kwargs)
++            self._post(i)
++            return out
++
++        return wrapped
++
++    def _pre(self, i: int) -> None:
++        slot = i % 2
++        if i == 0:
++            self._stage(0)
++        torch.cuda.current_stream().wait_event(self.copied[slot])
++        off = 0
++        for p, h in zip(self.params[i], self.host[i]):
++            n = h.numel()
++            p.data = self.slots[slot][off : off + n].view_as(h)
++            off += n
++        if i + 1 < len(self.blocks):
++            self._stage(i + 1)
++
++    def _post(self, i: int) -> None:
++        self.done[i % 2].record(torch.cuda.current_stream())
++        for p, h in zip(self.params[i], self.host[i]):
++            p.data = h
++
++
+ class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
+     def get_hf_config(self) -> Qwen4ExpConfig:
+         return self.ctx.get_hf_config(Qwen4ExpConfig)
+@@ -1554,7 +1639,8 @@ class Qwen4ExpForConditionalGeneration(
+         self.model_config = vllm_config.model_config
+         self.multimodal_config = multimodal_config
+         self.language_model_only = multimodal_config.language_model_only
+-        if self.language_model_only:
++        if self.language_model_only or not get_pp_group().is_first_rank:
++            # The V1/V2 runners execute the encoder on the first PP rank only.
+             self.use_data_parallel = False
+             self.is_multimodal_pruning_enabled = False
+             self.video_pruning_method = None
+@@ -1567,7 +1653,14 @@ class Qwen4ExpForConditionalGeneration(
+             self._init_video_pruning(multimodal_config)
+             self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
+ 
+-            with self._mark_tower_model(vllm_config, {"image", "video"}):
++            # Build and load the tower on the host and move it to the GPU only
++            # after every MoE repack has run: the first PP rank has no room
++            # for 0.84 GiB of ViT on top of the load-time repack transients.
++            self._visual_device = torch.get_default_device()
++            with (
++                self._mark_tower_model(vllm_config, {"image", "video"}),
++                torch.device("cpu"),
++            ):
+                 self.visual = Qwen3_VisionTransformer(
+                     config.vision_config,
+                     norm_eps=config.text_config.rms_norm_eps,
+@@ -1689,10 +1782,25 @@ class Qwen4ExpForConditionalGeneration(
+             self._clear_deepstack_input_embeds(inputs_embeds.size(0))
+         return hidden_states
+ 
++    def process_weights_after_loading(self) -> None:
++        if isinstance(self.visual, StageMissingLayer):
++            return
++        if os.environ.get("VLLM_VISION_HOST_STREAM", "1") == "1":
++            self._visual_stream = _HostStreamedBlocks(
++                self.visual, self.visual.blocks, self._visual_device
++            )
++        else:
++            self.visual.to(self._visual_device)
++        torch.accelerator.empty_cache()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         mapper = self.hf_to_vllm_mapper | WeightsMapper(
+             orig_to_new_substr={"mtp.": None},
+-            orig_to_new_prefix={"visual.": None} if self.language_model_only else {},
++            orig_to_new_prefix=(
++                {"visual.": None}
++                if isinstance(self.visual, StageMissingLayer)
++                else {}
++            ),
+         )
+         loader = AutoWeightsLoader(
+             self,

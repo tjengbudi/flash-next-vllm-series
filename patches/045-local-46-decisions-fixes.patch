@@ -1,0 +1,222 @@
+Binary files a/vllm/entrypoints/generate/structured_decisions/__pycache__/strategies.cpython-312.pyc and b/vllm/entrypoints/generate/structured_decisions/__pycache__/strategies.cpython-312.pyc differ
+diff -ruN a/vllm/entrypoints/generate/structured_decisions/strategies.py b/vllm/entrypoints/generate/structured_decisions/strategies.py
+--- a/vllm/entrypoints/generate/structured_decisions/strategies.py	2026-10-21 16:34:46.000000000 +0700
++++ b/vllm/entrypoints/generate/structured_decisions/strategies.py	2026-10-27 14:09:56.197650992 +0700
+@@ -55,6 +55,18 @@
+ 
+ logger = init_logger(__name__)
+ 
++# Fewer shared tokens are not worth an extra round trip before the reads.
++MIN_WARM_PREFIX_TOKENS = 128
++
++
++def common_prefix_len(prompts: Sequence[Sequence[int]]) -> int:
++    """The number of leading token ids that every prompt starts with."""
++    shortest = min(prompts, key=len)
++    for i, token_id in enumerate(shortest):
++        if any(p[i] != token_id for p in prompts):
++            return i
++    return len(shortest)
++
+ 
+ @dataclass
+ class ReadContext:
+@@ -288,6 +300,44 @@
+         ).token_ids
+         return engine_input, list(prompt_ids or [])
+ 
++    async def _warm_shared_prefix(
++        self,
++        prompts: Sequence[Sequence[int]],
++        request_id: str,
++        *,
++        lora_request: LoRARequest | None,
++        priority: int,
++        cache_salt: str | None,
++        trace_headers: Mapping[str, str] | None,
++    ) -> None:
++        """Prefill the tokens every question starts with, before the reads.
++
++        The reads share the state only through the prefix cache. Reads that
++        start together cannot reuse each other's recurrent state, so on hybrid
++        models each of them would prefill the state again. Attention-only
++        models share the blocks within a step and skip this.
++        """
++        engine_client = self.context.engine_client
++        if (
++            len(prompts) < 2
++            or not engine_client.model_config.is_hybrid
++            or not engine_client.vllm_config.cache_config.enable_prefix_caching
++        ):
++            return
++        shared = common_prefix_len(prompts)
++        if shared < MIN_WARM_PREFIX_TOKENS:
++            return
++        generator = engine_client.generate(
++            tokens_input(list(prompts[0][:shared]), cache_salt=cache_salt),
++            SamplingParams(max_tokens=1, temperature=0.0),
++            f"{request_id}-prefix",
++            lora_request=lora_request,
++            trace_headers=trace_headers,
++            priority=priority,
++        )
++        async for _ in generator:
++            pass
++
+     async def read(
+         self,
+         questions: list[Question],
+@@ -306,7 +356,7 @@
+         read_request = self._read_request(chat_template_kwargs, cache_salt)
+         image_parts = await self._image_parts((media or {}).get("image", ()))
+ 
+-        slots, engine_inputs, params = [], [], []
++        slots, engine_inputs, params, prompts = [], [], [], []
+         for q in questions:
+             content: Any = self._content(state, q)
+             if image_parts:
+@@ -320,12 +370,21 @@
+                     "these chat options end the prompt differently, so the "
+                     "labels' tokens are unknown"
+                 )
++            prompts.append(prompt_ids)
+             slots.append(self._label_groups(q))
+             engine_inputs.append(self._read_input(engine_input, prompt_ids))
+             params.append(
+                 self._sampling_params([i for ids in slots[-1] for i in ids], prompt_ids)
+             )
+ 
++        await self._warm_shared_prefix(
++            prompts,
++            request_id,
++            lora_request=lora_request,
++            priority=priority,
++            cache_salt=cache_salt,
++            trace_headers=trace_headers,
++        )
+         label_reads = await next_token_label_reads(
+             ctx.engine_client,
+             engine_inputs,
+diff -ruN a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+--- a/vllm/v1/worker/gpu/model_runner.py	2026-10-27 08:03:38.000000000 +0700
++++ b/vllm/v1/worker/gpu/model_runner.py	2026-10-27 14:09:17.865704909 +0700
+@@ -1718,12 +1718,7 @@
+                 local_batch=input_batch,
+                 gather_num_nans=self.sampler.compute_nans,
+                 logprobs_dims=self.sampler.get_logprobs_dims(
+-                    global_input_batch.idx_mapping_np,
+-                    # Rejection sampler does not return logprob token ids.
+-                    include_token_ids=(
+-                        global_input_batch.num_draft_tokens == 0
+-                        or self.rejection_sampler is None
+-                    ),
++                    global_input_batch.idx_mapping_np
+                 ),
+             )
+ 
+diff -ruN a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+--- a/vllm/v1/worker/gpu/sample/sampler.py	2026-10-22 08:42:07.000000000 +0700
++++ b/vllm/v1/worker/gpu/sample/sampler.py	2026-10-27 14:09:17.865704909 +0700
+@@ -115,17 +115,11 @@
+         if self.trace_replay_state is not None:
+             self.trace_replay_state.apply_staged_writes()
+ 
+-    def get_logprobs_dims(
+-        self, idx_mapping_np: np.ndarray, include_token_ids: bool = True
+-    ) -> tuple[int, int] | None:
++    def get_logprobs_dims(self, idx_mapping_np: np.ndarray) -> tuple[int, int] | None:
+         """(num_logprobs, max_per_req_token_ids) for the given requests, or
+         None when none of them want logprobs."""
+         max_num_logprobs = self.sampling_states.max_num_logprobs(idx_mapping_np)
+-        max_token_ids = (
+-            self.logprob_token_ids_state.max_num_token_ids(idx_mapping_np)
+-            if include_token_ids
+-            else 0
+-        )
++        max_token_ids = self.logprob_token_ids_state.max_num_token_ids(idx_mapping_np)
+         if max_num_logprobs == NO_LOGPROBS and max_token_ids == 0:
+             return None
+         num_logprobs = max_num_logprobs if max_num_logprobs != NO_LOGPROBS else 0
+Binary files a/vllm/v1/worker/gpu/spec_decode/__pycache__/rejection_sampler.cpython-312.pyc and b/vllm/v1/worker/gpu/spec_decode/__pycache__/rejection_sampler.cpython-312.pyc differ
+diff -ruN a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py	2026-10-23 18:43:56.000000000 +0700
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py	2026-10-27 14:09:35.581679931 +0700
+@@ -302,6 +302,10 @@
+         ss = self.ss
+         if int(np.max(ss.num_logprobs[idx_np])) != NO_LOGPROBS:
+             return None
++        # local-46 (#61219): the recorded verify returns no logprobs, so a request
++        # asking for logprob_token_ids takes the eager verify too.
++        if self.sampler.logprob_token_ids_state.max_num_token_ids(idx_np) != 0:
++            return None
+         if not np.any(self.sampler.needs_logits_processing[idx_np]):
+             return (n, False)
+         # Mirror apply_sampling_params: the logits processors must all skip.
+@@ -519,10 +523,12 @@
+         logits: torch.Tensor,
+         cu_num_logits: torch.Tensor,
+         cu_num_logits_np: np.ndarray,
+-        max_num_logprobs: int,
++        expanded_idx_mapping: torch.Tensor,
++        logprobs_dims: tuple[int, int] | None,
+     ) -> LogprobsTensors | None:
+-        if max_num_logprobs == NO_LOGPROBS:
++        if logprobs_dims is None:
+             return None
++        num_logprobs, max_token_ids = logprobs_dims
+ 
+         num_reqs = cu_num_logits.shape[0] - 1
+         num_logits = logits.shape[0]
+@@ -548,9 +554,12 @@
+                 cu_num_generated_tokens = cu_num_logits_np.tolist()
+         return compute_topk_scores(
+             logits,
+-            max_num_logprobs,
++            num_logprobs,
+             flat_sampled,
+             cu_num_generated_tokens,
++            logprob_token_ids_state=self.sampler.logprob_token_ids_state,
++            expanded_idx_mapping=expanded_idx_mapping,
++            max_per_req_token_ids=max_token_ids,
+             logits_mode=self.sampler.logprobs_mode
+             in ("raw_logits", "processed_logits"),
+         )
+@@ -624,7 +633,7 @@
+         draft_sampled: torch.Tensor,
+         pos: torch.Tensor,
+         max_chunk_logits: int,
+-        max_num_logprobs: int,
++        logprobs_dims: tuple[int, int] | None,
+     ) -> tuple[torch.Tensor, torch.Tensor, LogprobsTensors | None]:
+         cu_num_logits_np = input_batch.cu_num_logits_np
+         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
+@@ -668,7 +677,8 @@
+                 processed_logits if use_processed_logits else logits[lo:hi],
+                 chunk_cu_num_logits,
+                 chunk_cu_num_logits_np,
+-                max_num_logprobs,
++                input_batch.expanded_idx_mapping[lo:hi],
++                logprobs_dims,
+             )
+             if chunk_logprobs is not None:
+                 logprobs_chunks.append(chunk_logprobs)
+@@ -738,9 +748,7 @@
+             self.sampler.req_states.prefill_len.gpu,
+         )
+ 
+-        max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
+-            input_batch.idx_mapping_np
+-        )
++        logprobs_dims = self.sampler.get_logprobs_dims(input_batch.idx_mapping_np)
+         chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
+         sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
+             logits,
+@@ -749,7 +757,7 @@
+             draft_sampled,
+             pos,
+             chunk_logit_limit,
+-            max_num_logprobs,
++            logprobs_dims,
+         )
+ 
+         num_sampled, num_rejected = get_num_sampled_and_rejected(

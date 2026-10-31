@@ -1,0 +1,379 @@
+diff -ru a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+--- a/vllm/v1/worker/gpu/model_runner.py	2026-10-22 17:12:29.495662011 +0700
++++ b/vllm/v1/worker/gpu/model_runner.py	2026-10-22 17:13:31.436588664 +0700
+@@ -1072,6 +1072,23 @@
+                                 self._dummy_run(**batch)
+                         self.adaptive_verification.set_initial_cost_curves(timings)
+                     self.kv_connector.reset_capture_state()
++                    # local-21 (VLLM_CG_ATTN_META=1): record the attention
++                    # metadata builds the FULL decode graphs replay with.
++                    record = getattr(
++                        self.model_state, "record_decode_attn_metadata", None
++                    )
++                    if (
++                        record is not None
++                        and not profile_only
++                        and self.pcp_manager is None
++                    ):
++                        record(
++                            input_buffers,
++                            self.block_tables,
++                            self.attn_groups,
++                            self.kv_cache_config,
++                            self.cudagraph_manager,
++                        )
+ 
+             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+ 
+diff -ru a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py	2026-10-22 17:12:29.489662018 +0700
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py	2026-10-22 17:13:09.913614150 +0700
+@@ -1,6 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-from dataclasses import dataclass
++import os
++import sys
++import warnings
++from dataclasses import dataclass, replace
+ from typing import Any
+ 
+ import numpy as np
+@@ -9,6 +12,7 @@
+ 
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+@@ -35,6 +39,63 @@
+ )
+ from vllm.v1.worker.utils import AttentionGroup
+ 
++logger = init_logger(__name__)
++
++# local-21: FULL uniform spec-decode steps replay a CUDA graph of their
++# attention-metadata build (recorded at the end of CUDA graph capture, one per
++# batch shape) instead of rebuilding ~20 KV cache groups in Python. Off unless
++# VLLM_CG_ATTN_META=1, which leaves the l15 code path untouched.
++_CG_ATTN_META = os.environ.get("VLLM_CG_ATTN_META", "0") == "1"
++
++
++class _KeepPinnedH2D:
++    """While recording, stage every ``async_tensor_h2d`` source in a pinned
++    tensor kept alive with the graph: its memcpy node re-reads that host address
++    on each replay, so the bytes must neither be freed nor reused. Recorded
++    values are fixed by the batch shape (e.g. the all-spec-decode mask)."""
++
++    def __init__(self, keep: list[torch.Tensor]) -> None:
++        self.keep = keep
++        self.patched: list[Any] = []
++
++    def __enter__(self) -> "_KeepPinnedH2D":
++        from vllm.utils import torch_utils
++
++        orig = torch_utils.async_tensor_h2d
++        keep = self.keep
++
++        def h2d(data, device=None, dtype=None, out=None):
++            if dtype is None and out is not None:
++                dtype = out.dtype
++            if isinstance(data, np.ndarray):
++                data = torch.from_numpy(data)
++            if isinstance(data, torch.Tensor):
++                t = torch.empty(
++                    data.shape, dtype=dtype or data.dtype, pin_memory=True
++                ).copy_(data)
++            else:
++                t = torch.tensor(data, dtype=dtype, pin_memory=True)
++            keep.append(t)
++            if out is not None:
++                return out.copy_(t, non_blocking=True)
++            return t.to(device=device, dtype=dtype, non_blocking=True)
++
++        self.orig = orig
++        for name, mod in list(sys.modules.items()):
++            if (
++                name.startswith("vllm")
++                and mod is not None
++                and getattr(mod, "async_tensor_h2d", None) is orig
++            ):
++                mod.async_tensor_h2d = h2d
++                self.patched.append(mod)
++        return self
++
++    def __exit__(self, *exc) -> None:
++        for mod in self.patched:
++            mod.async_tensor_h2d = self.orig
++        self.patched.clear()
++
+ 
+ @dataclass
+ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
+@@ -108,6 +169,249 @@
+             self._mamba_spec: MambaSpec | None = None
+             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
+ 
++        # local-21 (VLLM_CG_ATTN_META=1): recorded metadata builds, by
++        # (num_reqs, num_reqs_padded, num_tokens, num_tokens_padded).
++        self._cg_meta_graphs: dict[
++            tuple[int, int, int, int], tuple[torch.cuda.CUDAGraph, dict[str, Any]]
++        ] = {}
++        self._cg_meta_enabled = _CG_ATTN_META and self._cg_meta_supported()
++        self._cg_meta_recording = False
++        self._cg_meta_qlen = vllm_config.num_speculative_tokens + 1
++        self._cg_meta_stride: int | None = None
++        self._cg_meta_pool = None
++        self._cg_meta_keep: list[torch.Tensor] = []
++        self._cg_meta_hits = 0
++        self._cg_meta_misses = 0
++        if self._cg_meta_enabled:
++            # MRV2 stages idx_mapping in a fresh tensor every step; the recorded
++            # build reads it from here instead.
++            self._cg_meta_idx = torch.zeros(
++                self.max_num_reqs, dtype=torch.int32, device=self.device
++            )
++        elif _CG_ATTN_META:
++            logger.warning(
++                "local-21: VLLM_CG_ATTN_META=1 ignored for this config "
++                "(needs CUDA, FULL decode graphs, spec decode, no DBO/DCP/PCP, "
++                "no RecoverSSM/R-SWA/fast-prefill, no KV connector other than "
++                "OffloadingConnector)"
++            )
++
++    def _cg_meta_supported(self) -> bool:
++        from vllm.platforms import current_platform
++
++        cfg = self.vllm_config
++        par = cfg.parallel_config
++        kvt = cfg.kv_transfer_config
++        connector_ok = kvt is None or kvt.kv_connector in (None, "OffloadingConnector")
++        return (
++            current_platform.is_cuda()
++            and cfg.compilation_config.cudagraph_mode.decode_mode()
++            == CUDAGraphMode.FULL
++            and cfg.num_speculative_tokens > 0
++            and self.recoverssm is None
++            and not getattr(par, "use_ubatching", False)
++            and par.decode_context_parallel_size == 1
++            and getattr(par, "prefill_context_parallel_size", 1) == 1
++            and not cfg.cache_config.kv_sharing_fast_prefill
++            and getattr(cfg.model_config, "rswa_window", None) is None
++            and connector_ok
++        )
++
++    def _cg_meta_key(self, input_batch: InputBatch) -> tuple[int, int, int, int] | None:
++        """Key of a FULL step whose metadata build a recording can replay: every
++        request a spec decode of exactly num_spec drafts, as recorded."""
++        if input_batch.has_prefill or input_batch.max_query_len is not None:
++            return None
++        n = input_batch.num_reqs
++        if input_batch.idx_mapping.shape[0] != n:
++            return None
++        if (
++            input_batch.prefill_runs_as_decode_np is not None
++            and input_batch.prefill_runs_as_decode_np[:n].any()
++        ):
++            return None
++        if input_batch.is_prefilling_np[:n].any():
++            return None
++        q = self._cg_meta_qlen
++        if not (input_batch.num_scheduled_tokens[:n] == q).all():
++            return None
++        nd = input_batch.num_draft_tokens_per_req
++        if nd is None or not (nd[:n] == q - 1).all():
++            return None
++        return (
++            n,
++            input_batch.num_reqs_after_padding,
++            input_batch.num_tokens,
++            input_batch.num_tokens_after_padding,
++        )
++
++    def _cg_meta_replay(self, input_batch: InputBatch) -> dict[str, Any] | None:
++        key = self._cg_meta_key(input_batch)
++        entry = self._cg_meta_graphs.get(key) if key is not None else None
++        if entry is not None and self._align_mode:
++            ctx = self._mamba_ctx
++            # The recording read the source block tables through the bound
++            # pointer array with this row stride; preprocess_state (re)binds it
++            # before every real step.
++            if (
++                ctx is None
++                or not ctx.is_initialized
++                or ctx.block_table_stride_req != self._cg_meta_stride
++            ):
++                entry = None
++        if entry is None:
++            self._cg_meta_misses += 1
++            return None
++        n = input_batch.num_reqs
++        self._cg_meta_idx[:n].copy_(input_batch.idx_mapping, non_blocking=True)
++        graph, attn_metadata = entry
++        graph.replay()
++        self._cg_meta_hits += 1
++        if (self._cg_meta_hits & 0x3FFF) == 0:
++            logger.info(
++                "local-21: metadata replays %d, eager FULL builds %d",
++                self._cg_meta_hits,
++                self._cg_meta_misses,
++            )
++        return attn_metadata
++
++    def record_decode_attn_metadata(
++        self,
++        input_buffers: Any,
++        block_tables: Any,
++        attn_groups: list[list[AttentionGroup]],
++        kv_cache_config: KVCacheConfig,
++        cudagraph_manager: Any,
++    ) -> None:
++        """local-21: record the metadata build of every uniform spec-decode
++        shape a FULL graph serves. Called once the forward graphs are captured."""
++        if not self._cg_meta_enabled:
++            return
++        self._cg_meta_graphs.clear()
++        self._cg_meta_keep.clear()
++        if self.vllm_config.compilation_config.cudagraph_mode.decode_mode() != (
++            CUDAGraphMode.FULL
++        ):
++            return
++        q = self._cg_meta_qlen
++        keys: list[tuple[int, int, int, int]] = []
++        for n in range(1, self.max_num_reqs + 1):
++            desc = cudagraph_manager.dispatch(
++                num_reqs=n, num_tokens=n * q, uniform_token_count=q, num_active_loras=0
++            )
++            if desc.cg_mode != CUDAGraphMode.FULL or desc.num_ubatches != 1:
++                continue
++            keys.append((n, desc.num_reqs or n, n * q, desc.num_tokens))
++        if not keys:
++            logger.warning("local-21: no FULL uniform decode shapes to record")
++            return
++
++        ctx = None
++        if self._align_mode:
++            # Bind the align context to the SOURCE per-request-slot tables now,
++            # so the recording reads them through the pointer array (and no
++            # binding write lands inside a graph). Released afterwards: the first
++            # real batch binds the same tables again, as without local-21.
++            mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
++            if self._mamba_ctx is not None:
++                self._mamba_ctx.is_initialized = False
++            ctx, _ = self._ensure_align_ctx(
++                kv_cache_config,
++                mamba_group_ids,
++                tuple(bt.gpu for bt in block_tables.block_tables),
++                bind=True,
++            )
++            self._cg_meta_stride = ctx.block_table_stride_req
++
++        if self._cg_meta_pool is None:
++            self._cg_meta_pool = torch.cuda.graph_pool_handle()
++        self._cg_meta_recording = True
++        try:
++            for key in keys:
++                try:
++                    self._cg_meta_record_one(
++                        key, input_buffers, block_tables, attn_groups, kv_cache_config
++                    )
++                except Exception as e:  # keep serving with the eager build
++                    self._cg_meta_graphs.pop(key, None)
++                    logger.warning(
++                        "local-21: recording metadata build %s failed: %r", key, e
++                    )
++        finally:
++            self._cg_meta_recording = False
++            if ctx is not None:
++                ctx.is_initialized = False
++        torch.accelerator.synchronize()
++        logger.info(
++            "local-21: recorded attention-metadata builds for %s",
++            sorted(self._cg_meta_graphs),
++        )
++
++    def _cg_meta_record_one(
++        self,
++        key: tuple[int, int, int, int],
++        input_buffers: Any,
++        block_tables: Any,
++        attn_groups: list[list[AttentionGroup]],
++        kv_cache_config: KVCacheConfig,
++    ) -> None:
++        n, n_pad, t, t_pad = key
++        q = self._cg_meta_qlen
++        dummy = InputBatch.make_dummy(n, t, input_buffers)
++        qsl_np = np.full(n_pad + 1, t, dtype=np.int32)
++        qsl_np[: n + 1] = np.arange(n + 1, dtype=np.int32) * q
++        input_buffers.query_start_loc[: n_pad + 1].copy_(torch.from_numpy(qsl_np))
++        input_buffers.seq_lens[n:].zero_()
++        batch = replace(
++            dummy,
++            num_reqs_after_padding=n_pad,
++            num_tokens_after_padding=t_pad,
++            idx_mapping=self._cg_meta_idx[:n],
++            num_scheduled_tokens=np.full(n, q, dtype=np.int32),
++            num_draft_tokens=n * (q - 1),
++            num_draft_tokens_per_req=np.full(n, q - 1, dtype=np.int32),
++            query_start_loc=input_buffers.query_start_loc[: n_pad + 1],
++            query_start_loc_np=qsl_np,
++            seq_lens=input_buffers.seq_lens[:n_pad],
++            # Worst case, as at capture: bounds host values only.
++            seq_lens_cpu_upper_bound=torch.full(
++                (n_pad,), self.max_model_len, dtype=torch.int32
++            ),
++            is_prefilling_np=np.zeros(n, dtype=np.bool_),
++            has_prefill=False,
++            prefill_runs_as_decode_np=None,
++            max_query_len=None,
++            input_ids=input_buffers.input_ids[:t_pad],
++            positions=input_buffers.positions[:t_pad],
++            is_padding=input_buffers.is_padding[:t_pad],
++        )
++        assert self._cg_meta_key(batch) == key, (self._cg_meta_key(batch), key)
++        self._cg_meta_idx.zero_()
++        tables = block_tables.get_dummy_block_tables(n_pad)
++        slots = block_tables.get_dummy_slot_mappings(t_pad)
++
++        def build() -> dict[str, Any]:
++            return self.prepare_attn(
++                batch,
++                CUDAGraphMode.FULL,
++                tables,
++                slots,
++                attn_groups,
++                kv_cache_config,
++            )
++
++        build()  # warm lazy allocations / kernel compiles outside the graph
++        torch.accelerator.synchronize()
++        graph = torch.cuda.CUDAGraph()
++        with (
++            _KeepPinnedH2D(self._cg_meta_keep),
++            torch.cuda.graph(graph, pool=self._cg_meta_pool),
++            warnings.catch_warnings(),
++        ):
++            warnings.filterwarnings("ignore", message="The CUDA Graph is empty")
++            attn_metadata = build()
++        self._cg_meta_graphs[key] = (graph, attn_metadata)
++
+     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+         super().add_request(req_index, new_req_data)
+         # Must reset the speculative acceptance count in this idx which could be stale.
+@@ -261,6 +565,15 @@
+     ) -> dict[str, Any]:
+         assert ubatch_idx == 0, "DBO is not supported"
+         assert model_specific_attn_metadata is None
++        if (
++            self._cg_meta_graphs
++            and not for_capture
++            and not self._cg_meta_recording
++            and cudagraph_mode == CUDAGraphMode.FULL
++        ):
++            recorded = self._cg_meta_replay(input_batch)
++            if recorded is not None:
++                return recorded
+         if cudagraph_mode == CUDAGraphMode.FULL:
+             num_reqs = input_batch.num_reqs_after_padding
+             num_tokens = input_batch.num_tokens_after_padding

@@ -1,0 +1,70 @@
+diff -ruN a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py	2026-10-03 15:06:30.000000000 +0700
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py	2026-10-23 08:57:22.613706678 +0700
+@@ -5,6 +5,8 @@
+ import math
+ from collections.abc import Callable
+ 
++import os
++
+ import torch
+ 
+ import vllm._custom_ops as ops
+@@ -221,6 +223,46 @@
+     return output
+ 
+ 
++
++# local-21c: moe_align_block_size places an expert's tokens with atomics, so
++# their order inside the expert's blocks changes from run to run. Marlin's
++# K-split partition of a tile depends on where a row lands, so on large GPUs
++# (82 SMs) the same token can get a different fp32 summation order and the
++# routed-expert output differs by an ulp between identical calls. Sorting the
++# token ids inside each expert run makes the layout, and so the result,
++# deterministic. Graph-capturable (no host sync). VLLM_MARLIN_MOE_DET_ALIGN=0
++# restores the upstream order.
++_DET_ALIGN = os.environ.get("VLLM_MARLIN_MOE_DET_ALIGN", "1") != "0"
++
++
++def _deterministic_expert_order(
++    sorted_token_ids: torch.Tensor,
++    expert_ids: torch.Tensor,
++    num_tokens_post_padded: torch.Tensor,
++    block_size: int,
++) -> torch.Tensor:
++    n = sorted_token_ids.numel()
++    n_blocks = min(expert_ids.numel(), n // block_size)
++    if n_blocks == 0:
++        return sorted_token_ids
++    span = n_blocks * block_size
++    ids = sorted_token_ids[:span].to(torch.int64)
++    e = expert_ids[:n_blocks].to(torch.int64)
++    # run id: consecutive blocks of the same expert form one run
++    run = torch.zeros_like(e)
++    if n_blocks > 1:
++        run[1:] = torch.cumsum((e[1:] != e[:-1]).to(torch.int64), dim=0)
++    pos = torch.arange(span, device=ids.device)
++    run_pos = run.repeat_interleave(block_size)
++    valid = pos < num_tokens_post_padded.to(torch.int64).reshape(-1)[:1]
++    big = n + 1
++    key = torch.where(valid, run_pos * big + ids, (n_blocks + 1) * big + pos)
++    order = torch.sort(key, stable=True).indices
++    out = sorted_token_ids.clone()
++    out[:span] = sorted_token_ids[:span][order]
++    return out
++
++
+ def fused_marlin_moe(
+     hidden_states: torch.Tensor,
+     w1: torch.Tensor,
+@@ -353,6 +395,10 @@
+         expert_map,
+         ignore_invalid_experts=True,
+     )
++    if _DET_ALIGN:
++        sorted_token_ids = _deterministic_expert_order(
++            sorted_token_ids, expert_ids, num_tokens_post_padded, block_size_m
++        )
+ 
+     assert activation is not None
+     moe_output = _fused_marlin_moe(

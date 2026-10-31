@@ -1,0 +1,174 @@
+--- a/vllm/v1/worker/gpu/pp_utils.py
++++ b/vllm/v1/worker/gpu/pp_utils.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Pipeline Parallelism utils for V2 Model Runner."""
+ 
++import os
+ from collections import deque
+ from dataclasses import dataclass
+ 
+@@ -10,11 +11,23 @@
+ 
+ import vllm.envs as envs
+ from vllm.distributed.parallel_state import get_pp_group
++from vllm.logger import init_logger
+ from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+ from vllm.utils.torch_utils import async_tensor_h2d
+ from vllm.v1.worker.gpu.input_batch import InputBatch
+ 
++logger = init_logger(__name__)
++
++# local-20 (vLLM #47686 idea, own layout): pack the per-step PP broadcasts
++# (sampled tokens, num_sampled/num_rejected, relayed MTP drafts) into ONE
++# collective on the pp_broadcast group instead of 2-3. Default OFF.
++_PP_PACKED_BCAST = os.environ.get("VLLM_PP_PACKED_BCAST", "0").strip().lower() in (
++    "1",
++    "true",
++    "yes",
++)
++
+ 
+ @dataclass
+ class PendingRecv:
+@@ -96,6 +109,46 @@
+         )
+         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
+ 
++        # local-20: packed single-collective mode. Flat int64 wire buffer per
++        # step, n = num_reqs, msl = max_sample_len, ns = num_speculative_steps:
++        #   [ sampled n*msl | counts n (= 2n int32: num_sampled[n],
++        #     num_rejected[n]) | draft n*ns ]
++        # Every field is a contiguous zero-copy view of the buffer on both
++        # sides, with the same shapes/dtypes as the unpacked path. Size is a
++        # pure function of n, so send/recv element counts always match.
++        self.packed_bcast = _PP_PACKED_BCAST
++        self.packed_cols = self.max_sample_len + 1 + self.num_speculative_steps
++        # Last rank, spec decode: (buffer, draft view) staged by broadcast()
++        # and sent by broadcast_drafts() after the draft columns are filled.
++        self._staged_packed: tuple[torch.Tensor, torch.Tensor] | None = None
++        if self.packed_bcast:
++            logger.info(
++                "PP packed broadcast enabled (VLLM_PP_PACKED_BCAST=1): "
++                "1 collective per step, %d int64 per request",
++                self.packed_cols,
++            )
++
++    def _packed_views(
++        self, buf: torch.Tensor, n: int
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
++        """(sampled [n, msl] i64, counts [2, n] i32, draft [n, ns] i64 | None)
++        as contiguous views of a freshly allocated (offset 0) flat buffer."""
++        msl = self.max_sample_len
++        ns = self.num_speculative_steps
++        sampled = buf.as_strided((n, msl), (msl, 1), 0)
++        counts = buf.view(torch.int32).as_strided((2, n), (n, 1), 2 * n * msl)
++        draft = buf.as_strided((n, ns), (ns, 1), n * (msl + 1)) if ns > 0 else None
++        return sampled, counts, draft
++
++    def _send_packed(self, buf: torch.Tensor) -> None:
++        with torch.cuda.stream(self.broadcast_stream):
++            self.broadcast_stream.wait_stream(self.main_stream)
++            torch.distributed.broadcast(
++                buf, src=self.last_rank, group=self.broadcast_group
++            )
++            # Allocated on the main stream, consumed on the broadcast stream.
++            buf.record_stream(self.broadcast_stream)
++
+     def on_req_idx_freed(self, req_idx: int) -> None:
+         self.req_idx_gen_np[req_idx] += 1
+ 
+@@ -174,6 +227,19 @@
+     ) -> None:
+         """Broadcast draft proposals so non-last ranks can embed real token ids."""
+         assert self.is_last_rank
++        if self.packed_bcast:
++            # Send iff broadcast() staged this step's buffer (same gating as
++            # the receivers' receive(); pairing holds by construction).
++            staged = self._staged_packed
++            if staged is None:
++                return
++            self._staged_packed = None
++            buf, draft_view = staged
++            torch.index_select(
++                draft_tokens, 0, input_batch.idx_mapping, out=draft_view
++            )
++            self._send_packed(buf)
++            return
+         if compute_need_sampled_mask(input_batch) is None:
+             return
+         with torch.cuda.stream(self.broadcast_stream):
+@@ -200,6 +266,33 @@
+         gen_at_receive_np = self.req_idx_gen_np[input_batch.idx_mapping_np]
+ 
+         num_reqs = input_batch.num_reqs
++        if self.packed_bcast:
++            with torch.cuda.stream(self.broadcast_stream):
++                self.broadcast_stream.wait_stream(self.main_stream)
++                buf = torch.empty(
++                    num_reqs * self.packed_cols, dtype=torch.int64, device=self.device
++                )
++                torch.distributed.broadcast(
++                    buf, src=self.last_rank, group=self.broadcast_group
++                )
++                event = self.broadcast_stream.record_event()
++                # Views share buf's storage; one record_stream covers them.
++                buf.record_stream(self.main_stream)
++            sampled_tokens, counts, draft_tokens = self._packed_views(buf, num_reqs)
++            num_sampled, num_rejected = counts.unbind(dim=0)
++            self.queue[-1] = PendingRecv(
++                event,
++                sampled_tokens,
++                num_sampled,
++                num_rejected,
++                input_batch.idx_mapping,
++                input_batch.idx_mapping_np,
++                need_sampled_mask,
++                gen_at_receive_np,
++                draft_tokens,
++            )
++            return bool(need_sampled_mask.all())
++
+         with torch.cuda.stream(self.broadcast_stream):
+             self.broadcast_stream.wait_stream(self.main_stream)
+             sampled_tokens = torch.empty(
+@@ -261,6 +354,38 @@
+         if current_platform.is_xpu():
+             self.main_stream.synchronize()
+ 
++        if self.packed_bcast:
++            # Build the packed buffer on the main stream (inputs live there).
++            n = sampled_token_ids.shape[0]
++            width = sampled_token_ids.shape[-1]
++            assert width <= self.max_sample_len
++            buf = torch.empty(
++                n * self.packed_cols, dtype=torch.int64, device=self.device
++            )
++            sampled_v, counts_v, draft_v = self._packed_views(buf, n)
++            if width == self.max_sample_len:
++                sampled_v.copy_(sampled_token_ids)
++            else:
++                # Same zero padding as F.pad in the unpacked path.
++                sampled_v[:, :width].copy_(sampled_token_ids)
++                sampled_v[:, width:].zero_()
++            if num_sampled.dtype == num_rejected.dtype == torch.int32:
++                # One kernel into the [2, n] int32 counts view.
++                torch.stack((num_sampled, num_rejected), dim=0, out=counts_v)
++            else:
++                counts_v[0].copy_(num_sampled)
++                counts_v[1].copy_(num_rejected)
++            if self.num_speculative_steps > 0:
++                # broadcast_drafts() fills the draft columns and sends.
++                # A leftover stage means a broadcast/broadcast_drafts pairing
++                # bug: crash instead of desyncing the collective count.
++                assert self._staged_packed is None, "unflushed PP packed stage"
++                assert draft_v is not None
++                self._staged_packed = (buf, draft_v)
++                return
++            self._send_packed(buf)
++            return
++
+         with torch.cuda.stream(self.broadcast_stream):
+             self.broadcast_stream.wait_stream(self.main_stream)
+             send_tokens = torch.nn.functional.pad(

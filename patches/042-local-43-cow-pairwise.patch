@@ -1,0 +1,38 @@
+--- a/vllm/v1/worker/utils.py	2026-10-27 07:06:35.362827940 +0700
++++ b/vllm/v1/worker/utils.py	2026-10-27 07:06:51.488814001 +0700
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import math
++import os
+ from collections import defaultdict
+ from collections.abc import Callable, Iterable, Mapping, Sequence
+ from dataclasses import dataclass, field
+@@ -717,6 +718,10 @@
+         return
+ 
+     indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
++    pairs = indices_np.tolist()
++    pairwise = os.environ.get("VLLM_COW_PAIRWISE", "1") == "1" and not (
++        set(indices_np[:, 0].tolist()) & set(indices_np[:, 1].tolist())
++    )
+     indices: torch.Tensor | None = None
+     seen: set[tuple[torch.device, int]] = set()
+     copied_storages: set[tuple[torch.device, int]] = set()
+@@ -754,7 +759,15 @@
+             # Fold virtual block splitting into the shape so that dim 0 counts
+             # scheduler blocks; unflatten of dim 0 is always a view.
+             blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
+-        blocks[dst] = blocks[src]
++        if pairwise:
++            # local-43: blocks[dst] = blocks[src] gathers every source block into a
++            # temporary first (186 MiB for 3 mamba-align hits on the shared storage,
++            # which OOMed GPU1 at 780M KV). Destinations are fresh blocks, so copy
++            # one view into the other instead.
++            for s, d in pairs:
++                blocks[d].copy_(blocks[s])
++        else:
++            blocks[dst] = blocks[src]
+ 
+     for hook in KV_CACHE_BLOCK_COPY_HOOKS:
+         hook(indices_np, num_blocks, dst_block_layers)

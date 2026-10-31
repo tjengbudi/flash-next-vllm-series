@@ -1,0 +1,78 @@
+If you would like to merge this patch upstream, I would appreciate it if you could keep me credited as the commit author, or add the following trailer to the commit message: 
+
+Co-authored-by: Minachist <84688797+aiueonicked@users.noreply.github.com>
+
+diff --git a/vllm/models/qwen4_exp/nvidia/model_state.py b/vllm/models/qwen4_exp/nvidia/model_state.py
+index 6898ef3..c2c778d 100644
+--- a/vllm/models/qwen4_exp/nvidia/model_state.py
++++ b/vllm/models/qwen4_exp/nvidia/model_state.py
+@@ -27,6 +27,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
+         super().__init__(vllm_config, model, encoder_cache, device)
+         config = self.model_config.hf_text_config
+         self.uses_ngram_embedding = bool(config.ple_layer_ids)
++        self._ple_ngram: nn.Module | None = None
+         if not self.uses_ngram_embedding:
+             self.ngram_context_len = 0
+             self.ngram_eos_token_id = 0
+@@ -79,6 +80,25 @@ class Qwen4ExpModelState(MambaHybridModelState):
+             device=self.device,
+         )
+ 
++        # The mmap PLE backend gathers from prepare_inputs instead of the
++        # forward (see Qwen4ExpPLEMmapHostEmbedding). The PLE layer is on the
++        # first pipeline rank, so other ranks find nothing.
++        for _, module in model.named_modules():
++            embedding = getattr(module, "ngram_embedding", None)
++            if embedding is not None and getattr(
++                embedding, "prefetch_from_model_state", False
++            ):
++                self._ple_ngram = module
++                break
++        if self._ple_ngram is not None:
++            # prepare_dummy_inputs() gets token counts, not tokens. Profiling
++            # and capture only need the buffer written, so gather zero ids.
++            self._ple_dummy_input_ids = torch.zeros(
++                self.max_num_tokens,
++                dtype=torch.int32,
++                device=self.device,
++            )
++
+     def _prepare_ngram_context(
+         self,
+         input_batch: InputBatch,
+@@ -121,10 +141,19 @@ class Qwen4ExpModelState(MambaHybridModelState):
+         query_start_loc[: num_reqs_padded + 1].copy_(input_batch.query_start_loc)
+         # Represent unused capacity as trailing zero-length requests.
+         query_start_loc[num_reqs_padded + 1 :].copy_(input_batch.query_start_loc[-1])
++        ngram_context = self._prepare_ngram_context(input_batch, req_states)
+         model_inputs.update(
+             query_start_loc=query_start_loc,
+-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
++            ngram_context=ngram_context,
+         )
++        if self._ple_ngram is not None:
++            # input_ids is padded to the row count of the forward, so every
++            # row the graph reads is filled.
++            self._ple_ngram.host_gather(
++                input_batch.input_ids,
++                query_start_loc,
++                ngram_context,
++            )
+         return model_inputs
+ 
+     def prepare_dummy_inputs(
+@@ -156,6 +185,14 @@ class Qwen4ExpModelState(MambaHybridModelState):
+             query_start_loc=query_start_loc,
+             ngram_context=ngram_context,
+         )
++        if self._ple_ngram is not None:
++            # Graph capture reads the buffer too. cudagraph_utils calls this
++            # before torch.cuda.graph(), so the gather is not captured.
++            self._ple_ngram.host_gather(
++                self._ple_dummy_input_ids[:num_tokens],
++                query_start_loc,
++                ngram_context,
++            )
+         return model_inputs
+ 
+ 

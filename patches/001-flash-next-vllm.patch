@@ -1,0 +1,2000 @@
+Port note (budi, 2026-10-12): regenerated for vLLM 0.31.0 from the 0.30.0
+version below. Three upstream changes between 0.30.0 and 0.31.0 collided:
+  * #58957 (HC down projection + SiLU fused, CuTe DSL) needs the merged
+    down+inject weight and only runs on sm_90+. This patch splits that weight
+    again, so hyperconnection.py is the 0.30.0 file plus this patch's hunks
+    (the fused path is gone; on sm_86 it never ran) and the sm_90 warmup in
+    model.py stays a no-op here.
+  * #58114/#57497 moved the PLE embedding classes from
+    nvidia/ngram_embedding.py into common/ngram_embedding.py, unchanged apart
+    from an AMD-only sync_lookup. The NVIDIA module goes back to its 0.30.0
+    layout (all classes in one file, as the decode/ttft/local patches expect),
+    plus #58489: the prefetch n-gram ids live in their own buffer instead of
+    eager-break args in the CUDA graph pool.
+  * #55557 (FP8 main K/V on the QSA path) rewrote forward_qsa; the staged
+    prefill split is ported onto it and the direct calls keep its k/v scales.
+_qsa_offload_layers also counts the new "qwen_sparse_attention" layer type.
+
+If you would like to merge this patch upstream, I would appreciate it if you could keep me credited as the commit author, or add the following trailer to the commit message: 
+
+Co-authored-by: Minachist <84688797+aiueonicked@users.noreply.github.com>
+
+Qwen3.8-Flash-Next support for vLLM 0.30.0
+
+Port note (budi, 2026-09-26): regenerated from the 0.29.1rc1.dev47+gdc36fcce9
+version. vLLM 0.30.0 fuses the attention output gate into the QSA kernels:
+forward_qsa takes output_gate and forward() no longer multiplies the attention
+output by sigmoid(gate). The staged prefill kernel now applies the same gate
+epilogue as _qsa_sparse_paged_gqa_splitk_kernel (round to the output dtype,
+then gate in FP32), and forward_qsa passes output_gate to the staged call and
+to both direct calls around it. Applied unported, the staged rows came back
+ungated (max |diff| 0.17 against the gated reference on the model's shapes).
+
+Apply from the directory that contains the `vllm` package:
+
+    patch -p1 < flash-next-vllm.patch
+
+Touches nine files:
+
+  vllm/models/qwen4_exp/nvidia/model.py            quantized embed / lm_head / hyper-connection
+  vllm/models/qwen4_exp/nvidia/hyperconnection.py  split the merged HC projection
+  vllm/models/qwen4_exp/nvidia/ngram_embedding.py  mmap-backed PLE table
+  vllm/models/qwen4_exp/nvidia/model_state.py      allow PP>1 when PLE stays on rank 0
+  vllm/model_executor/models/config.py             same check, engine side
+  vllm/v1/core/kv_cache_utils.py                   empty KV group on a pipeline rank
+  vllm/models/qwen4_exp/nvidia/qsa.py              QSA main K/V in host memory
+  vllm/models/qwen4_exp/nvidia/ops/qsa.py          staged prefill for host-resident K/V
+  vllm/platforms/interface.py                      attention block size under QSA offload
+
+This patch is a derivative work of vLLM (https://github.com/vllm-project/vllm)
+and it changes the nine files listed above. It is licensed under the Apache
+License, Version 2.0, the same license as vLLM. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0 or in the LICENSE file
+next to this patch.
+
+Copyright 2026 Minachist
+
+diff --git a/vllm/model_executor/models/__pycache__/config.cpython-312.pyc b/vllm/model_executor/models/__pycache__/config.cpython-312.pyc
+new file mode 100644
+index 0000000..a4c2f34
+Binary files /dev/null and b/vllm/model_executor/models/__pycache__/config.cpython-312.pyc differ
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index 3c87b06..ba5b0c8 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -894,12 +894,27 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
+             )
+         # Checked again in Qwen4ExpModelState; rejecting it here keeps the
+         # engine from loading weights first.
+-        if text_config.ple_layer_ids and parallel_config.pipeline_parallel_size > 1:
+-            raise NotImplementedError(
+-                "Qwen4Exp N-gram PLE embedding requires pipeline_parallel_size=1 "
+-                "because non-first pipeline ranks do not receive the raw input_ids "
+-                "it needs. Please run with PP=1."
++        pp_size = parallel_config.pipeline_parallel_size
++        if text_config.ple_layer_ids and pp_size > 1:
++            from vllm.distributed.utils import get_pp_indices
++
++            first_start, first_end = get_pp_indices(
++                int(text_config.num_hidden_layers), 0, pp_size
+             )
++            stranded = sorted(
++                abs_id - 1
++                for abs_id in text_config.ple_layer_ids
++                if not (first_start <= abs_id - 1 < first_end)
++            )
++            if stranded:
++                raise NotImplementedError(
++                    "Qwen4Exp N-gram PLE embedding needs every PLE layer on the "
++                    "first pipeline rank, because later ranks do not receive the "
++                    f"raw input_ids it consumes. pipeline_parallel_size={pp_size} "
++                    f"strands decoder layer(s) {stranded} outside the first "
++                    f"rank's range [{first_start}, {first_end}). Run with PP=1, "
++                    "or repartition with VLLM_PP_LAYER_PARTITION."
++                )
+         multimodal_config = vllm_config.model_config.multimodal_config
+         if multimodal_config is not None and multimodal_config.language_model_only:
+             _strip_qwen4_exp_mrope(vllm_config.model_config)
+diff --git a/vllm/models/qwen4_exp/nvidia/__pycache__/hyperconnection.cpython-312.pyc b/vllm/models/qwen4_exp/nvidia/__pycache__/hyperconnection.cpython-312.pyc
+new file mode 100644
+index 0000000..912766c
+Binary files /dev/null and b/vllm/models/qwen4_exp/nvidia/__pycache__/hyperconnection.cpython-312.pyc differ
+diff --git a/vllm/models/qwen4_exp/nvidia/__pycache__/model.cpython-312.pyc b/vllm/models/qwen4_exp/nvidia/__pycache__/model.cpython-312.pyc
+new file mode 100644
+index 0000000..16532ad
+Binary files /dev/null and b/vllm/models/qwen4_exp/nvidia/__pycache__/model.cpython-312.pyc differ
+diff --git a/vllm/models/qwen4_exp/nvidia/__pycache__/model_state.cpython-312.pyc b/vllm/models/qwen4_exp/nvidia/__pycache__/model_state.cpython-312.pyc
+new file mode 100644
+index 0000000..d01d7d5
+Binary files /dev/null and b/vllm/models/qwen4_exp/nvidia/__pycache__/model_state.cpython-312.pyc differ
+diff --git a/vllm/models/qwen4_exp/nvidia/__pycache__/ngram_embedding.cpython-312.pyc b/vllm/models/qwen4_exp/nvidia/__pycache__/ngram_embedding.cpython-312.pyc
+new file mode 100644
+index 0000000..90c8c20
+Binary files /dev/null and b/vllm/models/qwen4_exp/nvidia/__pycache__/ngram_embedding.cpython-312.pyc differ
+diff --git a/vllm/models/qwen4_exp/nvidia/__pycache__/qsa.cpython-312.pyc b/vllm/models/qwen4_exp/nvidia/__pycache__/qsa.cpython-312.pyc
+new file mode 100644
+index 0000000..5ef6313
+Binary files /dev/null and b/vllm/models/qwen4_exp/nvidia/__pycache__/qsa.cpython-312.pyc differ
+diff --git a/vllm/models/qwen4_exp/nvidia/hyperconnection.py b/vllm/models/qwen4_exp/nvidia/hyperconnection.py
+index dcf8daa..e4333b1 100644
+--- a/vllm/models/qwen4_exp/nvidia/hyperconnection.py
++++ b/vllm/models/qwen4_exp/nvidia/hyperconnection.py
+@@ -25,19 +25,14 @@ Typical usage inside a transformer decoder layer::
+ import torch
+ from torch import nn
+ 
+-import vllm.envs as envs
+-from vllm.model_executor.layers.linear import (
+-    MergedColumnParallelLinear,
+-    ReplicatedLinear,
+-)
++from vllm.model_executor.layers.linear import ReplicatedLinear
++from vllm.model_executor.layers.quantization import QuantizationConfig
+ from vllm.model_executor.models.utils import maybe_prefix
+-from vllm.platforms import current_platform
+ 
+ from ..common.hyperconnection import (
+     GroupedGemmaRMSNorm,
+     HyperConnectionConfig,
+ )
+-from .ops.cute_dsl.hc_down_silu import MAX_FUSED_M, hc_down_silu
+ from .ops.hc import (
+     grouped_gemma_rmsnorm,
+     hc_combine,
+@@ -61,15 +56,16 @@ class GatedResidual(nn.Module):
+     injection.
+ 
+     Weights: the norm owns the grouped GemmaRMSNorm affine; the projections
+-    are vLLM Linear modules (merged replicated linear for down+inject).
+-    Eligible down+inject projections use the fused SiLU GEMM; other projections
+-    use their Linear module's GEMM dispatch.
++    are vLLM Linear modules (merged replicated linear for down+inject), so
++    GEMM dispatch (e.g. the low-latency skinny GEMM) applies through the
++    standard quant_method mechanism.
+     """
+ 
+     def __init__(
+         self,
+         config: HyperConnectionConfig,
+         use_combine: bool = True,
++        quant_config: QuantizationConfig | None = None,
+         prefix: str = "",
+     ) -> None:
+         super().__init__()
+@@ -91,73 +87,38 @@ class GatedResidual(nn.Module):
+             group_size=group_size,
+             dtype=config.params_dtype,
+         )
+-
+-        # -- vLLM Linear weights --------------------------------------------
+-        # The merged skinny-GEMM shape is physically padded to 16 rows to ensure
+-        # good alignment and performant implementation chosen by CuBLAS heuristics.
+-        self.pad_size = (-(self.lora_rank + self.hc_count)) % 16 if use_combine else 0
++        self.input_mix_weight_down = ReplicatedLinear(
++            self.hyper_hidden_size,
++            self.lora_rank,
++            bias=False,
++            params_dtype=config.params_dtype,
++            quant_config=quant_config,
++            prefix=maybe_prefix(prefix, "input_mix_weight_down"),
++            return_bias=False,
++            disable_tp=True,
++        )
+         if use_combine:
+-            self.input_mix_weight_down_block_inject = MergedColumnParallelLinear(
++            self.block_inject_weight = ReplicatedLinear(
+                 self.hyper_hidden_size,
+-                [self.lora_rank, self.hc_count]
+-                + ([self.pad_size] if self.pad_size else []),
++                self.hc_count,
+                 bias=False,
+                 params_dtype=config.params_dtype,
+                 quant_config=None,
+-                prefix=maybe_prefix(prefix, "input_mix_weight_down_block_inject"),
++                prefix=maybe_prefix(prefix, "block_inject_weight"),
+                 return_bias=False,
+                 disable_tp=True,
+             )
+-            weight = self.input_mix_weight_down_block_inject.weight
+-            self._use_hc_down_silu = (
+-                weight.shape[1] % 8 == 0
+-                and weight.dtype == torch.bfloat16
+-                and current_platform.has_device_capability(90)
+-            )
+-        else:
+-            self.input_mix_weight_down = ReplicatedLinear(
+-                self.hyper_hidden_size,
+-                self.lora_rank,
+-                bias=False,
+-                params_dtype=config.params_dtype,
+-                quant_config=None,
+-                prefix=maybe_prefix(prefix, "input_mix_weight_down"),
+-                return_bias=False,
+-            )
+         self.input_mix_weight_up = ReplicatedLinear(
+             self.lora_rank,
+             self.hyper_hidden_size,
+             bias=False,
+             params_dtype=config.params_dtype,
+-            quant_config=None,
++            quant_config=quant_config,
+             prefix=maybe_prefix(prefix, "input_mix_weight_up"),
+             return_bias=False,
++            disable_tp=True,
+         )
+ 
+-    def _down_and_inject(
+-        self, xn: torch.Tensor
+-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+-        """Down projection + SiLU; also returns injection logits if combined."""
+-        if not self.use_combine:
+-            return hc_silu(self.input_mix_weight_down(xn), self.hc_count), None
+-
+-        use_fused = (
+-            self._use_hc_down_silu
+-            and not envs.VLLM_BATCH_INVARIANT
+-            and 1 <= xn.shape[0] <= MAX_FUSED_M
+-        )
+-        if use_fused:
+-            return hc_down_silu(
+-                xn,
+-                self.input_mix_weight_down_block_inject.weight,
+-                self.lora_rank,
+-                self.hc_count,
+-            )
+-        down_and_injection = self.input_mix_weight_down_block_inject(xn)
+-        split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
+-        lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+-        return hc_silu(lora, self.hc_count), injection
+-
+     def mix(
+         self, hidden_states: torch.Tensor
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+@@ -168,7 +129,13 @@ class GatedResidual(nn.Module):
+             self.hc_count,
+         )
+ 
+-        lora, injection = self._down_and_inject(xn)
++        if self.use_combine:
++            injection = self.block_inject_weight(xn)
++        else:
++            injection = None
++        lora = self.input_mix_weight_down(xn)
++
++        lora = hc_silu(lora, self.hc_count)
+         gate = self.input_mix_weight_up(lora)  # [M, D]
+         block_input = hc_gate_mix(xn, gate, self.hc_count)
+ 
+@@ -196,7 +163,13 @@ class GatedResidual(nn.Module):
+             self.hc_count,
+         )
+ 
+-        lora, injection = self._down_and_inject(xn)
++        if self.use_combine:
++            injection = self.block_inject_weight(xn)
++        else:
++            injection = None
++        lora = self.input_mix_weight_down(xn)
++
++        lora = hc_silu(lora, self.hc_count)
+         gate = self.input_mix_weight_up(lora)  # [M, D]
+         block_input = hc_gate_mix(xn, gate, self.hc_count)
+ 
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index a7e24bc..2f63682 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -143,14 +143,6 @@ _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
+ # into adjacent logical shards of a MergedColumnParallelLinear.
+ _EXTRA_WEIGHTS_MAPPER = WeightsMapper(
+     orig_to_new_stacked={
+-        "hyper_connection.input_mix_weight_down.weight": (
+-            "hyper_connection.input_mix_weight_down_block_inject.weight",
+-            0,
+-        ),
+-        "hyper_connection.block_inject_weight.weight": (
+-            "hyper_connection.input_mix_weight_down_block_inject.weight",
+-            1,
+-        ),
+         "ple.key_proj": ("ple.kv_proj", 0),
+         "ple.value_proj": ("ple.kv_proj", 1),
+     }
+@@ -267,10 +259,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
+         )
+         self.attn_hyper_connection = GatedResidual(
+             hc_config,
++            quant_config=quant_config,
+             prefix=maybe_prefix(prefix, "attn_hyper_connection"),
+         )
+         self.mlp_hyper_connection = GatedResidual(
+             hc_config,
++            quant_config=quant_config,
+             prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
+         )
+ 
+@@ -402,7 +396,12 @@ class Qwen4ExpModel(nn.Module):
+                 and getattr(config, "indexer_n_heads", None) is not None
+             )
+         )
+-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
++        self.embed_tokens = VocabParallelEmbedding(
++            self.vocab_size,
++            config.hidden_size,
++            quant_config=vllm_config.quant_config,
++            prefix=maybe_prefix(prefix, "embed_tokens"),
++        )
+ 
+         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
+             layer_idx = extract_layer_index(prefix)
+@@ -438,6 +437,7 @@ class Qwen4ExpModel(nn.Module):
+             self.hyper_connection_mixer = GatedResidual(
+                 hc_config,
+                 use_combine=False,
++                quant_config=vllm_config.quant_config,
+                 prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
+             )
+         else:
+@@ -649,11 +649,6 @@ class Qwen4ExpForCausalLM(
+         "kv_proj": ["key_proj", "value_proj"],
+         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+         "in_proj_ba": ["in_proj_b", "in_proj_a"],
+-        "input_mix_weight_down_block_inject": [
+-            "input_mix_weight_down",
+-            "block_inject_weight",
+-            "_input_mix_padding",
+-        ],
+     }
+     hf_to_vllm_mapper = WeightsMapper(
+         orig_to_new_prefix={"model.language_model.": "model."}
+@@ -679,6 +674,7 @@ class Qwen4ExpForCausalLM(
+         self.lm_head = ParallelLMHead(
+             config.vocab_size,
+             config.hidden_size,
++            quant_config=self.quant_config,
+             prefix=maybe_prefix(prefix, "lm_head"),
+         )
+         self.logits_processor = LogitsProcessor(config.vocab_size)
+@@ -894,11 +890,6 @@ class Qwen4ExpForConditionalGeneration(
+ 
+     packed_modules_mapping = Qwen3_5ForConditionalGeneration.packed_modules_mapping | {
+         "kv_proj": ["key_proj", "value_proj"],
+-        "input_mix_weight_down_block_inject": [
+-            "input_mix_weight_down",
+-            "block_inject_weight",
+-            "_input_mix_padding",
+-        ],
+     }
+ 
+     @staticmethod
+diff --git a/vllm/models/qwen4_exp/nvidia/model_state.py b/vllm/models/qwen4_exp/nvidia/model_state.py
+index 2461685..6898ef3 100644
+--- a/vllm/models/qwen4_exp/nvidia/model_state.py
++++ b/vllm/models/qwen4_exp/nvidia/model_state.py
+@@ -32,13 +32,28 @@ class Qwen4ExpModelState(MambaHybridModelState):
+             self.ngram_eos_token_id = 0
+             return
+ 
+-        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+-            raise RuntimeError(
+-                "N-gram PLE embedding currently requires "
+-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
+-                "not receive the raw input_ids required by PLE. Please run "
+-                "with PP=1."
++        pp_size = vllm_config.parallel_config.pipeline_parallel_size
++        if pp_size > 1:
++            from vllm.distributed.utils import get_pp_indices
++
++            num_layers = int(config.num_hidden_layers)
++            first_start, first_end = get_pp_indices(num_layers, 0, pp_size)
++            stranded = sorted(
++                abs_id - 1
++                for abs_id in config.ple_layer_ids
++                if not (first_start <= abs_id - 1 < first_end)
+             )
++            if stranded:
++                raise RuntimeError(
++                    "N-gram PLE embedding requires every PLE layer to live on "
++                    "the first pipeline rank, because later ranks do not "
++                    "receive the raw input_ids that PLE consumes. "
++                    f"pipeline_parallel_size={pp_size} strands decoder "
++                    f"layer(s) {stranded} outside the first rank's range "
++                    f"[{first_start}, {first_end}). Run with PP=1, or "
++                    "repartition with VLLM_PP_LAYER_PARTITION so that the PLE "
++                    "layers stay on rank 0."
++                )
+ 
+         self.ngram_context_len = int(config.ngram_size) - 1
+         if self.ngram_context_len <= 0:
+diff --git a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+index 0b6fd65..8fe2642 100644
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+@@ -2,42 +2,793 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Qwen4Exp n-gram embeddings with device and pinned-host storage."""
+ 
++import mmap
++import os
++import re
++from abc import ABC, abstractmethod
+ from collections.abc import Iterable
++from typing import ClassVar
+ 
++import numpy as np
+ import torch
++import torch.nn.functional as F
+ from torch import nn
+ 
++from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+ from vllm.config import get_current_vllm_config
++from vllm.distributed import get_dp_group, get_etp_group, get_tp_group
++from vllm.forward_context import DPMetadata, get_forward_context
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.quantization.base_config import (
+     QuantizationConfig,
++    QuantizeMethodBase,
++)
++from vllm.model_executor.layers.quantization.fp8 import Fp8Config
++from vllm.model_executor.layers.quantization.modelopt import (
++    ModelOptMixedPrecisionConfig,
++    ModelOptQuantConfigBase,
++)
++from vllm.model_executor.layers.quantization.utils.fp8_utils import (
++    create_fp8_scale_parameter,
++)
++from vllm.model_executor.layers.quantization.utils.quant_utils import (
++    is_layer_skipped,
+ )
+ from vllm.model_executor.models.utils import AutoWeightsLoader
++from vllm.model_executor.parameter import (
++    ModelWeightParameter,
++    PerTensorScaleParameter,
++)
++from vllm.model_executor.utils import set_weight_attrs
+ from vllm.transformers_utils.configs.qwen4_exp import (
+     Qwen4ExpTextConfig,
+ )
++from vllm.triton_utils import tl, triton
++from vllm.utils.platform_utils import is_uva_available
++from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+ 
+-from ..common.ngram_embedding import (
+-    Qwen4ExpPLEDeviceEmbedding,
+-    Qwen4ExpPLEEmbedding,
+-    Qwen4ExpPLEEmbeddingMethod,
+-    Qwen4ExpPLEFp8EmbeddingMethod,
+-    Qwen4ExpPLEPinnedHostEmbedding,
+-    Qwen4ExpPLEUnquantizedEmbeddingMethod,
+-)
++from ..common.ple import PLEVocabParallelEmbedding
+ from .ops.ple import ple_ngram_ids
+ 
+ logger = init_logger(__name__)
+ 
+-__all__ = [
+-    "Qwen4ExpPLEDeviceEmbedding",
+-    "Qwen4ExpPLEEmbedding",
+-    "Qwen4ExpPLEEmbeddingMethod",
+-    "Qwen4ExpPLEFp8EmbeddingMethod",
+-    "Qwen4ExpPLEPinnedHostEmbedding",
+-    "Qwen4ExpPLEUnquantizedEmbeddingMethod",
+-    "Qwen4ExpNGramEmbedding",
+-]
++
++def _ple_compressed_tensors_claims(
++    quant_config: QuantizationConfig,
++    names: list[str],
++) -> bool:
++    """Whether any compressed-tensors config group names one of ``names``."""
++    targets = getattr(quant_config, "target_scheme_map", None) or {}
++    for target in targets:
++        if target.startswith("re:"):
++            try:
++                pattern = re.compile(target[3:])
++            except re.error:
++                continue
++            if any(pattern.fullmatch(name) for name in names):
++                return True
++        elif any(name == target for name in names):
++            return True
++    return False
++
++
++def _ple_method_for_compressed_tensors(
++    quant_config: QuantizationConfig,
++    prefix: str,
++) -> "Qwen4ExpPLEEmbeddingMethod":
++    """Resolve a PLE table against a compressed-tensors checkpoint."""
++    names = [prefix, f"{prefix}.weight", f"{prefix}.shard_0"]
++    if _ple_compressed_tensors_claims(quant_config, names):
++        raise NotImplementedError(
++            f"compressed-tensors claims to quantize the PLE table {prefix}, "
++            "but vLLM has no gather-and-dequantize kernel for it"
++        )
++    return Qwen4ExpPLEUnquantizedEmbeddingMethod()
++
++
++class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
++    """ETP-sharded PLE table shared by device and pinned-host backends."""
++
++    supports_prefetch: ClassVar[bool] = False
++
++    def __init__(
++        self,
++        num_embeddings: int,
++        embedding_dim: int,
++        *,
++        params_dtype: torch.dtype,
++        padding_size: int,
++        prefix: str,
++        embedding_method: "Qwen4ExpPLEEmbeddingMethod",
++        num_ngram_heads: int = 1,
++        max_total_tokens: int = 0,
++        data_parallel_rank: int = 0,
++    ) -> None:
++        del num_ngram_heads, max_total_tokens
++        super().__init__(
++            num_embeddings,
++            embedding_dim,
++            params_dtype=params_dtype,
++            padding_size=padding_size,
++            prefix=prefix,
++            quant_method=embedding_method,
++            parallel_group=get_etp_group(),
++        )
++        self.embedding_method = embedding_method
++        self.data_parallel_rank = data_parallel_rank
++        tp_size = get_tp_group().world_size
++        if self.tp_size % tp_size:
++            raise ValueError(
++                "ETP size must be divisible by TP size, but got "
++                f"ETP={self.tp_size} and TP={tp_size}"
++            )
++        self.etp_data_parallel_size = self.tp_size // tp_size
++
++    @abstractmethod
++    def allocate_embedding_weight(
++        self,
++        num_embeddings: int,
++        embedding_dim: int,
++        dtype: torch.dtype,
++    ) -> torch.Tensor:
++        """Allocate storage for the complete embedding weight."""
++        raise NotImplementedError
++
++    def dequantize(
++        self,
++        embeddings: torch.Tensor,
++        output_dtype: torch.dtype,
++    ) -> torch.Tensor:
++        """Delegate storage-format conversion to the embedding method."""
++        return self.embedding_method.dequantize(self, embeddings, output_dtype)
++
++    def _get_dp_gather_slot(self, local_num_tokens: int) -> tuple[int, int]:
++        """Return the per-DP slot size and this rank's slot offset."""
++        if self.etp_data_parallel_size == 1:
++            return local_num_tokens, 0
++        dp_metadata: DPMetadata | None = get_forward_context().dp_metadata
++        if dp_metadata is None:
++            raise RuntimeError("ETP spanning DP requires DP token metadata")
++        group_start = (self.data_parallel_rank // self.etp_data_parallel_size) * (
++            self.etp_data_parallel_size
++        )
++        group_end = group_start + self.etp_data_parallel_size
++        token_counts = dp_metadata.num_tokens_across_dp_cpu.tolist()
++        group_counts = token_counts[group_start:group_end]
++        slot_size = max(group_counts)
++        dp_rank = get_dp_group().rank_in_group
++        return slot_size, dp_rank * slot_size
++
++    def _gather_dp_ids(
++        self,
++        ngram_ids: torch.Tensor,
++        slot_size: int,
++    ) -> torch.Tensor:
++        """Gather DP-local IDs that share one ETP-sharded PLE table."""
++        if self.etp_data_parallel_size == 1:
++            return ngram_ids
++        if ngram_ids.shape[0] < slot_size:
++            padding = ngram_ids.new_zeros(
++                slot_size - ngram_ids.shape[0], ngram_ids.shape[1]
++            )
++            ngram_ids = torch.cat((ngram_ids, padding), dim=0)
++        return get_dp_group().all_gather(ngram_ids, dim=0)
++
++    def _select_embeddings(
++        self,
++        embeddings: torch.Tensor,
++        local_num_tokens: int,
++        slot_offset: int,
++    ) -> torch.Tensor:
++        """Select this DP rank's rows from the ETP-reduced embeddings."""
++        if self.etp_data_parallel_size == 1:
++            return embeddings
++        return embeddings.narrow(0, slot_offset, local_num_tokens)
++
++    @abstractmethod
++    def start_prefetch(
++        self,
++        hidden_states: torch.Tensor,
++        ngram_ids: torch.Tensor,
++    ) -> None:
++        """Start an asynchronous lookup when supported."""
++        raise NotImplementedError
++
++
++class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
++    """Quantization interface shared by resident and pinned PLE tables."""
++
++    # PLE post-load processing only validates scales in their current storage.
++    requires_device_loading: bool = False
++
++    @staticmethod
++    def from_quant_config(
++        quant_config: QuantizationConfig | None,
++        prefix: str,
++        embedding_dtype: str | None = None,
++    ) -> "Qwen4ExpPLEEmbeddingMethod":
++        """Select the concrete PLE embedding format for a layer."""
++        if embedding_dtype == "float8_e4m3fn":
++            return Qwen4ExpPLEFp8EmbeddingMethod()
++        if quant_config is None:
++            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
++        if quant_config.get_name() == "compressed-tensors":
++            return _ple_method_for_compressed_tensors(quant_config, prefix)
++        if isinstance(quant_config, ModelOptMixedPrecisionConfig):
++            if quant_config._resolve_quant_algo(prefix) == "FP8":
++                return Qwen4ExpPLEFp8EmbeddingMethod()
++            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
++        if isinstance(
++            quant_config, ModelOptQuantConfigBase
++        ) and quant_config.is_layer_excluded(prefix):
++            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
++        if not isinstance(quant_config, Fp8Config):
++            raise NotImplementedError(
++                "Qwen4Exp PLE embedding does not support quantization config "
++                f"{type(quant_config).__name__}"
++            )
++
++        ignored_layers = quant_config.ignored_layers
++        if is_layer_skipped(
++            prefix,
++            ignored_layers,
++            quant_config.packed_modules_mapping,
++            match_mode=quant_config.ignored_layers_match_mode,
++        ):
++            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
++        # PLE checkpoint shards form one runtime embedding parameter.
++        shard_prefix = f"{prefix}.shard_"
++        if any(name.startswith(shard_prefix) for name in ignored_layers):
++            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
++        if not quant_config.is_checkpoint_fp8_serialized:
++            raise NotImplementedError(
++                "Qwen4Exp PLE embedding only supports serialized FP8 checkpoints"
++            )
++        return Qwen4ExpPLEFp8EmbeddingMethod()
++
++    def apply(
++        self,
++        layer: nn.Module,
++        x: torch.Tensor,
++        bias: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        raise NotImplementedError("PLE weights only support embedding lookup")
++
++    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
++        return F.embedding(input_, layer.weight)
++
++    @abstractmethod
++    def dequantize(
++        self,
++        layer: nn.Module,
++        embeddings: torch.Tensor,
++        output_dtype: torch.dtype,
++    ) -> torch.Tensor:
++        """Convert looked-up PLE rows to the activation dtype."""
++        raise NotImplementedError
++
++
++class Qwen4ExpPLEUnquantizedEmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
++    """Unquantized PLE embedding storage and lookup semantics."""
++
++    def create_weights(
++        self,
++        layer: Qwen4ExpPLEEmbedding,
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ) -> None:
++        del input_size, output_size
++        weight = nn.Parameter(
++            layer.allocate_embedding_weight(
++                sum(output_partition_sizes),
++                input_size_per_partition,
++                params_dtype,
++            ),
++            requires_grad=False,
++        )
++        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
++        set_weight_attrs(weight, extra_weight_attrs)
++        layer.register_parameter("weight", weight)
++
++    def dequantize(
++        self,
++        layer: nn.Module,
++        embeddings: torch.Tensor,
++        output_dtype: torch.dtype,
++    ) -> torch.Tensor:
++        del layer, output_dtype
++        return embeddings
++
++
++class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
++    """FP8 PLE embedding with one global checkpoint scale."""
++
++    def create_weights(
++        self,
++        layer: Qwen4ExpPLEEmbedding,
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ) -> None:
++        del input_size, output_size, params_dtype
++        weight_loader = extra_weight_attrs.get("weight_loader")
++        weight = ModelWeightParameter(
++            data=layer.allocate_embedding_weight(
++                sum(output_partition_sizes),
++                input_size_per_partition,
++                torch.float8_e4m3fn,
++            ),
++            input_dim=1,
++            output_dim=0,
++            weight_loader=weight_loader,
++        )
++        layer.register_parameter("weight", weight)
++
++        weight_scale = create_fp8_scale_parameter(
++            PerTensorScaleParameter,
++            output_partition_sizes,
++            input_size_per_partition,
++            None,
++            weight_loader,
++            scale_dtype=torch.float32,
++        )
++        layer.register_parameter("weight_scale", weight_scale)
++
++    def process_weights_after_loading(self, layer: nn.Module) -> None:
++        """Reject FP8 PLE checkpoints without a global scale."""
++        sentinel = torch.finfo(torch.float32).min
++        if torch.any(layer.weight_scale == sentinel):
++            raise ValueError("FP8 PLE checkpoint is missing its global scale")
++
++    def dequantize(
++        self,
++        layer: nn.Module,
++        embeddings: torch.Tensor,
++        output_dtype: torch.dtype,
++    ) -> torch.Tensor:
++        weight_scale = getattr(layer, "weight_scale", None)
++        if weight_scale is None:
++            raise RuntimeError("FP8 PLE embedding is missing its global scale")
++        if weight_scale.device != embeddings.device:
++            raise RuntimeError("FP8 PLE embedding scale must be on the output device")
++        return embeddings.to(output_dtype) * weight_scale.to(output_dtype)
++
++
++class Qwen4ExpPLEDeviceEmbedding(Qwen4ExpPLEEmbedding):
++    """PLE table allocated on the active model device."""
++
++    def allocate_embedding_weight(
++        self,
++        num_embeddings: int,
++        embedding_dim: int,
++        dtype: torch.dtype,
++    ) -> torch.Tensor:
++        """Allocate the complete PLE weight on the active device."""
++        return torch.empty(num_embeddings, embedding_dim, dtype=dtype)
++
++    def start_prefetch(
++        self,
++        hidden_states: torch.Tensor,
++        ngram_ids: torch.Tensor,
++    ) -> None:
++        """Resident embedding prefetch is a no-op."""
++        return None
++
++    def forward(self, ngram_ids: torch.Tensor) -> torch.Tensor:
++        """Gather ETP inputs, look up embeddings, and select local rows."""
++        slot_size, slot_offset = self._get_dp_gather_slot(ngram_ids.shape[0])
++        gathered_ids = self._gather_dp_ids(ngram_ids, slot_size)
++        embeddings = super().forward(gathered_ids)
++        return self._select_embeddings(
++            embeddings,
++            ngram_ids.shape[0],
++            slot_offset,
++        )
++
++
++@triton.jit
++def _lookup_ple_embedding_from_pinned_kernel(
++    weight_ptr,
++    ids_ptr,
++    output_ptr,
++    embedding_dim,
++    tp_vocab_start,
++    tp_vocab_end,
++    BLOCK_D: tl.constexpr,
++):
++    """Look up TP-owned PLE rows through a CUDA view of pinned host memory."""
++    row_id = tl.program_id(0)
++    global_idx = tl.load(ids_ptr + row_id)
++    in_range = (global_idx >= tp_vocab_start) & (global_idx < tp_vocab_end)
++    local_idx = tl.where(in_range, global_idx - tp_vocab_start, 0)
++    offsets = tl.arange(0, BLOCK_D)
++    store_mask = offsets < embedding_dim
++    load_mask = store_mask & in_range
++    values = tl.load(
++        weight_ptr + local_idx * embedding_dim + offsets,
++        mask=load_mask,
++        other=0.0,
++    )
++    tl.store(
++        output_ptr + row_id * embedding_dim + offsets,
++        values,
++        mask=store_mask,
++    )
++
++
++class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
++    """PLE table loaded into pinned CPU memory and looked up through UVA."""
++
++    supports_prefetch: ClassVar[bool] = True
++
++    def __init__(
++        self,
++        num_embeddings: int,
++        embedding_dim: int,
++        *,
++        params_dtype: torch.dtype,
++        padding_size: int,
++        prefix: str,
++        embedding_method: Qwen4ExpPLEEmbeddingMethod,
++        num_ngram_heads: int = 1,
++        max_total_tokens: int = 0,
++        data_parallel_rank: int = 0,
++    ) -> None:
++        if not is_uva_available():
++            raise RuntimeError("Engram CPU offload requires UVA support")
++        super().__init__(
++            num_embeddings,
++            embedding_dim,
++            params_dtype=params_dtype,
++            padding_size=padding_size,
++            prefix=prefix,
++            embedding_method=embedding_method,
++            num_ngram_heads=num_ngram_heads,
++            max_total_tokens=max_total_tokens,
++            data_parallel_rank=data_parallel_rank,
++        )
++        self._uva_weight = get_accelerator_view_from_cpu_tensor(self.weight)
++        self._block_d = triton.next_power_of_2(self.embedding_dim)
++        self._prefetch_stream = torch.cuda.Stream(device=self._uva_weight.device)
++        self._prefetch_buffer = torch.empty(
++            max_total_tokens * self.etp_data_parallel_size,
++            num_ngram_heads,
++            self.embedding_dim,
++            dtype=self.weight.dtype,
++            device=self._uva_weight.device,
++        )
++        self._output_dim = num_ngram_heads * self.embedding_dim
++
++    def allocate_embedding_weight(
++        self,
++        num_embeddings: int,
++        embedding_dim: int,
++        dtype: torch.dtype,
++    ) -> torch.Tensor:
++        """Allocate the complete PLE weight directly in pinned CPU memory."""
++        return torch.empty(
++            num_embeddings,
++            embedding_dim,
++            dtype=dtype,
++            device="cpu",
++            pin_memory=True,
++        )
++
++    def _lookup(
++        self,
++        input_ids: torch.Tensor,
++        output: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Look up local ETP rows while preserving the weight storage dtype."""
++        expected_shape = (*input_ids.shape, self.embedding_dim)
++        if output is None:
++            output = torch.empty(
++                expected_shape,
++                dtype=self.weight.dtype,
++                device=input_ids.device,
++            )
++        elif (
++            tuple(output.shape) != expected_shape
++            or output.dtype != self.weight.dtype
++            or output.device != input_ids.device
++        ):
++            raise ValueError(
++                "PLE prefetch output must match the input shape, weight dtype, "
++                "and input device"
++            )
++
++        flat_ids = input_ids.reshape(-1).long()
++        if flat_ids.numel():
++            _lookup_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
++                self._uva_weight,
++                flat_ids,
++                output,
++                self.embedding_dim,
++                self.shard_indices.org_vocab_start_index,
++                self.shard_indices.org_vocab_end_index,
++                BLOCK_D=self._block_d,
++            )
++        return output
++
++    def _reduce_etp_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
++        """Combine pinned lookup results owned by different ETP ranks."""
++        if self.tp_size == 1:
++            return embeddings
++        assert self.parallel_group is not None
++        if embeddings.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
++            # Each vocabulary row has one owner, so reduce the raw FP8 bytes.
++            reduced = self.parallel_group.all_reduce(embeddings.view(torch.int8))
++            return reduced.view(embeddings.dtype)
++        return self.parallel_group.all_reduce(embeddings)
++
++    @eager_break_during_capture
++    def start_prefetch(
++        self,
++        hidden_states: torch.Tensor,
++        ngram_ids: torch.Tensor,
++    ) -> None:
++        """Gather ETP IDs and launch their UVA lookup on the side stream."""
++        slot_size, _ = self._get_dp_gather_slot(ngram_ids.shape[0])
++        gathered_ids = self._gather_dp_ids(ngram_ids, slot_size)
++        active_output = self._prefetch_buffer[: gathered_ids.shape[0]]
++        prefetch_stream = self._prefetch_stream
++        prefetch_stream.wait_stream(torch.cuda.current_stream())
++        gathered_ids.record_stream(prefetch_stream)
++        with torch.cuda.stream(prefetch_stream):
++            self._lookup(gathered_ids, output=active_output)
++
++    @eager_break_during_capture
++    def _finalize_prefetch(
++        self,
++        prefetch_output: torch.Tensor,
++        output: torch.Tensor,
++    ) -> None:
++        """Join the side stream, reduce ETP shards, and select local rows."""
++        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
++        slot_size, slot_offset = self._get_dp_gather_slot(output.shape[0])
++        active_output = prefetch_output[: slot_size * self.etp_data_parallel_size]
++        embeddings = self._reduce_etp_embeddings(active_output)
++        embeddings = self._select_embeddings(
++            embeddings,
++            output.shape[0],
++            slot_offset,
++        )
++        output.copy_(embeddings.flatten(-2))
++
++    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        """Finish the pinned lookup into graph-owned output storage."""
++        output = self._prefetch_buffer.new_empty(
++            (hidden_states.shape[0], self._output_dim)
++        )
++        self._finalize_prefetch(self._prefetch_buffer, output)
++        return output
++
++
++_PLE_MMAP_PATH_ENV = "VLLM_PLE_MMAP_PATH"
++_PLE_MMAP_REBUILD_ENV = "VLLM_PLE_MMAP_REBUILD"
++
++# numpy has no bfloat16, so rows are gathered through a same-width int view.
++_PLE_STORAGE_NUMPY_DTYPES = {1: np.int8, 2: np.int16, 4: np.int32}
++_PLE_STORAGE_TORCH_DTYPES = {1: torch.int8, 2: torch.int16, 4: torch.int32}
++
++
++class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
++    """PLE table kept on disk and gathered on the host through a mmap.
++
++    ``VLLM_PLE_MMAP_PATH`` names a raw C-contiguous
++    ``[num_embeddings_padded, embedding_dim]`` array in the checkpoint's
++    storage dtype. It is the ``shard_0 .. shard_N`` tensors concatenated in
++    index order. A missing file is created and filled while the checkpoint
++    loads. An existing file of the right size is mapped copy-on-write and not
++    written. ``VLLM_PLE_MMAP_REBUILD=1`` forces a refill.
++
++    Requires ETP=1, and cudagraph mode NONE or PIECEWISE with
++    ``VLLM_USE_BREAKABLE_CUDAGRAPH=1``.
++    """
++
++    def __init__(
++        self,
++        num_embeddings: int,
++        embedding_dim: int,
++        *,
++        params_dtype: torch.dtype,
++        padding_size: int,
++        prefix: str,
++        embedding_method: "Qwen4ExpPLEEmbeddingMethod",
++        num_ngram_heads: int = 1,
++        max_total_tokens: int = 0,
++        data_parallel_rank: int = 0,
++    ) -> None:
++        self._mmap_path = os.environ.get(_PLE_MMAP_PATH_ENV, "").strip()
++        if not self._mmap_path:
++            raise RuntimeError(
++                f"{_PLE_MMAP_PATH_ENV} must point at the raw PLE table file"
++            )
++        self._mmap_array: "np.memmap | None" = None
++        self._mmap_prefilled = False
++        # Skip Qwen4ExpPLEPinnedHostEmbedding.__init__, which requires UVA. The
++        # other methods of that class are reused.
++        Qwen4ExpPLEEmbedding.__init__(
++            self,
++            num_embeddings,
++            embedding_dim,
++            params_dtype=params_dtype,
++            padding_size=padding_size,
++            prefix=prefix,
++            embedding_method=embedding_method,
++            num_ngram_heads=num_ngram_heads,
++            max_total_tokens=max_total_tokens,
++            data_parallel_rank=data_parallel_rank,
++        )
++        if self.tp_size != 1:
++            raise RuntimeError(
++                "The mmap PLE backend requires ETP=1 because the mapped file "
++                f"holds the whole table; got ETP={self.tp_size}"
++            )
++
++        from vllm.compilation.breakable_cudagraph import (
++            is_breakable_cudagraph_enabled,
++        )
++        from vllm.config.compilation import CUDAGraphMode
++
++        cg_mode = get_current_vllm_config().compilation_config.cudagraph_mode
++        if cg_mode not in (CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE):
++            raise RuntimeError(
++                "mmap PLE requires cudagraph_mode NONE or PIECEWISE, not FULL"
++            )
++        if cg_mode == CUDAGraphMode.PIECEWISE and not is_breakable_cudagraph_enabled():
++            raise RuntimeError(
++                "mmap PLE PIECEWISE requires VLLM_USE_BREAKABLE_CUDAGRAPH=1"
++            )
++
++        device = torch.device("cuda", torch.cuda.current_device())
++        self._block_d = triton.next_power_of_2(self.embedding_dim)
++        self._prefetch_stream = torch.cuda.Stream(device=device)
++        self._prefetch_buffer = torch.empty(
++            max_total_tokens * self.etp_data_parallel_size,
++            num_ngram_heads,
++            self.embedding_dim,
++            dtype=self.weight.dtype,
++            device=device,
++        )
++        self._host_stage = torch.empty(
++            max_total_tokens * self.etp_data_parallel_size * num_ngram_heads,
++            self.embedding_dim,
++            dtype=self.weight.dtype,
++            device="cpu",
++            pin_memory=True,
++        )
++        storage_dtype = _PLE_STORAGE_TORCH_DTYPES[self.weight.dtype.itemsize]
++        self._host_stage_np = self._host_stage.view(storage_dtype).numpy()
++        self._output_dim = num_ngram_heads * self.embedding_dim
++
++    def allocate_embedding_weight(
++        self,
++        num_embeddings: int,
++        embedding_dim: int,
++        dtype: torch.dtype,
++    ) -> torch.Tensor:
++        """Map the complete PLE weight from the raw file on disk."""
++        np_dtype = _PLE_STORAGE_NUMPY_DTYPES.get(dtype.itemsize)
++        if np_dtype is None:
++            raise RuntimeError(
++                f"mmap PLE backend cannot represent a {dtype.itemsize}-byte "
++                f"storage dtype ({dtype})"
++            )
++        path = self._mmap_path
++        nbytes = num_embeddings * embedding_dim * dtype.itemsize
++        exists = os.path.exists(path)
++        if exists:
++            actual = os.path.getsize(path)
++            if actual != nbytes:
++                raise RuntimeError(
++                    f"PLE mmap table {path} is {actual} bytes but this model "
++                    f"needs {nbytes} for [{num_embeddings}, {embedding_dim}] "
++                    f"{dtype}. Point {_PLE_MMAP_PATH_ENV} elsewhere or delete "
++                    "the stale file."
++                )
++        rebuild = os.environ.get(_PLE_MMAP_REBUILD_ENV, "0").strip() not in ("", "0")
++        self._mmap_prefilled = exists and not rebuild
++        if not exists:
++            parent = os.path.dirname(os.path.abspath(path))
++            os.makedirs(parent, exist_ok=True)
++            with open(path, "wb") as handle:
++                handle.truncate(nbytes)
++        # Copy-on-write, so a stray write cannot corrupt a shared cache file.
++        mode = "c" if self._mmap_prefilled else "r+"
++        self._mmap_array = np.memmap(
++            path,
++            dtype=np_dtype,
++            mode=mode,
++            shape=(num_embeddings, embedding_dim),
++        )
++        # Rows are read at random offsets, so readahead is turned off.
++        raw_map = getattr(self._mmap_array, "_mmap", None)
++        if raw_map is not None and hasattr(raw_map, "madvise"):
++            try:
++                raw_map.madvise(mmap.MADV_RANDOM)
++            except OSError as err:
++                logger.warning("MADV_RANDOM on the PLE table failed: %s", err)
++        logger.info(
++            "PLE table mapped from %s (%.2f GiB, mode=%s, prefilled=%s)",
++            path,
++            nbytes / (1 << 30),
++            mode,
++            self._mmap_prefilled,
++        )
++        return torch.from_numpy(self._mmap_array).view(dtype)
++
++    def weight_loader(
++        self,
++        param: torch.Tensor,
++        loaded_weight: torch.Tensor,
++        checkpoint_start: int | None = None,
++    ) -> None:
++        """Skip the copy when the mapped file already holds the table."""
++        if self._mmap_prefilled:
++            return
++        super().weight_loader(param, loaded_weight, checkpoint_start)
++
++    def finalize_mmap_cache(self) -> None:
++        """Flush a freshly filled table so the next run can skip loading."""
++        if self._mmap_prefilled or self._mmap_array is None:
++            return
++        self._mmap_array.flush()
++        self._mmap_prefilled = True
++        logger.info("PLE table written to %s", self._mmap_path)
++
++    def _lookup(
++        self,
++        input_ids: torch.Tensor,
++        output: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Gather the requested rows on the host and copy them to the device."""
++        expected_shape = (*input_ids.shape, self.embedding_dim)
++        if output is None:
++            output = torch.empty(
++                expected_shape,
++                dtype=self.weight.dtype,
++                device=input_ids.device,
++            )
++        elif (
++            tuple(output.shape) != expected_shape
++            or output.dtype != self.weight.dtype
++            or output.device != input_ids.device
++        ):
++            raise ValueError(
++                "PLE prefetch output must match the input shape, weight dtype, "
++                "and input device"
++            )
++
++        flat_ids = input_ids.reshape(-1)
++        count = flat_ids.numel()
++        if count:
++            if count > self._host_stage.shape[0]:
++                raise RuntimeError(
++                    f"PLE host staging buffer holds {self._host_stage.shape[0]} "
++                    f"rows but {count} were requested"
++                )
++            # Copying the ids to the CPU synchronizes with the device.
++            ids = flat_ids.to(device="cpu", dtype=torch.int64).numpy()
++            vocab_start = self.shard_indices.org_vocab_start_index
++            vocab_end = self.shard_indices.org_vocab_end_index
++            in_range = (ids >= vocab_start) & (ids < vocab_end)
++            local_ids = np.where(in_range, ids - vocab_start, 0)
++            stage = self._host_stage_np[:count]
++            np.take(self._mmap_array, local_ids, axis=0, out=stage)
++            if not in_range.all():
++                stage[~in_range] = 0
++            output.view(-1, self.embedding_dim).copy_(
++                self._host_stage[:count], non_blocking=True
++            )
++        return output
+ 
+ 
+ class Qwen4ExpNGramEmbedding(nn.Module):
+@@ -208,11 +959,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+         if params_dtype is None:
+             params_dtype = torch.get_default_dtype()
+         engram_config = get_current_vllm_config().engram_config
+-        embedding_cls = (
+-            Qwen4ExpPLEPinnedHostEmbedding
+-            if engram_config is not None and engram_config.cpu_offload
+-            else Qwen4ExpPLEDeviceEmbedding
+-        )
++        if os.environ.get(_PLE_MMAP_PATH_ENV, "").strip():
++            embedding_cls = Qwen4ExpPLEMmapHostEmbedding
++        elif engram_config is not None and engram_config.cpu_offload:
++            embedding_cls = Qwen4ExpPLEPinnedHostEmbedding
++        else:
++            embedding_cls = Qwen4ExpPLEDeviceEmbedding
+         self.ngram_embedding = embedding_cls(
+             padded_vocab_size,
+             self.head_dim,
+@@ -445,6 +1197,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+ 
+         if regular_weights:
+             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
++        finalize = getattr(self.ngram_embedding, "finalize_mmap_cache", None)
++        if finalize is not None:
++            finalize()
+         return loaded
+ 
+ 
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/__pycache__/qsa.cpython-312.pyc b/vllm/models/qwen4_exp/nvidia/ops/__pycache__/qsa.cpython-312.pyc
+new file mode 100644
+index 0000000..0c63e8a
+Binary files /dev/null and b/vllm/models/qwen4_exp/nvidia/ops/__pycache__/qsa.cpython-312.pyc differ
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index 401048e..44a0a90 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -591,6 +591,317 @@ def _select_config(
+     return BLOCK_N, num_warps, num_tiles, num_splits
+ 
+ 
++@triton.jit(do_not_specialize=["num_rows", "page_lo", "pages_in_arena"])
++def _qsa_sparse_staged_gqa_kernel(
++    q_ptr,
++    k_arena_ptr,
++    v_arena_ptr,
++    indices_ptr,
++    row_map_ptr,
++    acc_ptr,
++    max_ptr,
++    norm_ptr,
++    output_ptr,
++    output_gate_ptr,
++    stride_q_row,
++    stride_q_head,
++    stride_k_block,
++    stride_k_token,
++    stride_k_head,
++    stride_v_block,
++    stride_v_token,
++    stride_v_head,
++    stride_indices_row,
++    stride_output_row,
++    stride_output_head,
++    stride_output_gate_row,
++    stride_output_gate_head,
++    num_rows,
++    page_lo,
++    pages_in_arena,
++    TOPK: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    GROUP_SIZE: tl.constexpr,
++    HEAD_DIM: tl.constexpr,
++    NUM_QUERY_HEADS: tl.constexpr,
++    NUM_TILES: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    FIRST_BUCKET: tl.constexpr,
++    LAST_BUCKET: tl.constexpr,
++) -> None:
++    local_row = tl.program_id(0)
++    kv_head = tl.program_id(1)
++    row = tl.load(row_map_ptr + local_row)
++
++    valid_count = tl.load(indices_ptr + row * stride_indices_row + TOPK)
++
++    head_offsets = tl.arange(0, BLOCK_M)
++    dim_offsets = tl.arange(0, HEAD_DIM)
++    column_offsets = tl.arange(0, BLOCK_N)
++    first_head = kv_head * GROUP_SIZE
++    head_mask = head_offsets < GROUP_SIZE
++    query = tl.load(
++        q_ptr
++        + row * stride_q_row
++        + (first_head + head_offsets[:, None]) * stride_q_head
++        + dim_offsets[None, :],
++        mask=head_mask[:, None],
++        other=0.0,
++    )
++
++    state_head = local_row.to(tl.int64) * NUM_QUERY_HEADS + first_head + head_offsets
++    if FIRST_BUCKET:
++        max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
++        normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
++        accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
++    else:
++        max_value = tl.load(max_ptr + state_head, mask=head_mask, other=-1.0e20)
++        normalizer = tl.load(norm_ptr + state_head, mask=head_mask, other=0.0)
++        accumulator = tl.load(
++            acc_ptr + state_head[:, None] * HEAD_DIM + dim_offsets[None, :],
++            mask=head_mask[:, None],
++            other=0.0,
++        )
++
++    softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
++    tile_end = tl.minimum(NUM_TILES, tl.cdiv(tl.minimum(valid_count, TOPK), BLOCK_N))
++
++    for tile in range(0, tile_end):
++        columns = tile * BLOCK_N + column_offsets
++        logical_token = tl.load(
++            indices_ptr + row * stride_indices_row + columns,
++            mask=columns < TOPK,
++            other=-1,
++        )
++        safe_token = tl.maximum(logical_token, 0)
++        logical_page = safe_token // PAGE_SIZE
++        page_offset = safe_token % PAGE_SIZE
++        arena_page = logical_page - page_lo
++        valid = (
++            (logical_token >= 0) & (arena_page >= 0) & (arena_page < pages_in_arena)
++        )
++        safe_page = tl.maximum(arena_page, 0).to(tl.int64)
++        keys = tl.load(
++            k_arena_ptr
++            + safe_page[None, :] * stride_k_block
++            + page_offset[None, :] * stride_k_token
++            + kv_head * stride_k_head
++            + dim_offsets[:, None],
++            mask=valid[None, :],
++            other=0.0,
++        )
++        values = tl.load(
++            v_arena_ptr
++            + safe_page[:, None] * stride_v_block
++            + page_offset[:, None] * stride_v_token
++            + kv_head * stride_v_head
++            + dim_offsets[None, :],
++            mask=valid[:, None],
++            other=0.0,
++        )
++        scores = tl.dot(query, keys)
++        scores *= softmax_scale_log2
++        scores = tl.where(valid[None, :], scores, -1.0e20)
++        next_max = tl.maximum(max_value, tl.max(scores, axis=1))
++        alpha = tl.math.exp2(max_value - next_max)
++        probabilities = tl.where(
++            valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
++        )
++        accumulator = tl.dot(
++            probabilities.to(values.dtype),
++            values,
++            acc=accumulator * alpha[:, None],
++        )
++        normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
++        max_value = next_max
++
++    if LAST_BUCKET:
++        has_values = normalizer > 0
++        normalized_output = tl.where(
++            has_values[:, None],
++            accumulator / tl.maximum(normalizer[:, None], 1.0e-20),
++            0.0,
++        )
++        # Same gate epilogue as _qsa_sparse_paged_gqa_splitk_kernel: round the
++        # attention output to the output dtype first, then gate in FP32.
++        normalized_output = normalized_output.to(output_ptr.dtype.element_ty)
++        output_gate = tl.load(
++            output_gate_ptr
++            + row * stride_output_gate_row
++            + (first_head + head_offsets[:, None]) * stride_output_gate_head
++            + dim_offsets[None, :],
++            mask=head_mask[:, None],
++            other=0.0,
++        ).to(tl.float32)
++        normalized_output = normalized_output.to(tl.float32) * tl.sigmoid(output_gate)
++        tl.store(
++            output_ptr
++            + row * stride_output_row
++            + (first_head + head_offsets[:, None]) * stride_output_head
++            + dim_offsets[None, :],
++            normalized_output,
++            mask=head_mask[:, None],
++        )
++    else:
++        tl.store(max_ptr + state_head, max_value, mask=head_mask)
++        tl.store(norm_ptr + state_head, normalizer, mask=head_mask)
++        tl.store(
++            acc_ptr + state_head[:, None] * HEAD_DIM + dim_offsets[None, :],
++            accumulator,
++            mask=head_mask[:, None],
++        )
++
++
++def qsa_staged_arena_pages(arena_bytes: int, page_bytes: int) -> int:
++    """Number of logical pages the staging arena holds (at least one)."""
++    return max(1, arena_bytes // max(page_bytes, 1))
++
++
++def qsa_sparse_paged_attention_staged(
++    q: torch.Tensor,
++    kv_cache: torch.Tensor,
++    logical_indices: torch.Tensor,
++    block_table_row: torch.Tensor,
++    rows: torch.Tensor,
++    max_logical_page: int,
++    arena: torch.Tensor,
++    use_prefill_config: bool,
++    out: torch.Tensor,
++    *,
++    output_gate: torch.Tensor,
++) -> None:
++    """Run the rows in ``rows`` against host-resident K/V via the arena.
++
++    Caller contract (use the direct path when it cannot be met):
++      * ``rows`` belongs to a single request and ``block_table_row`` is that
++        request's block table row.
++      * ``kv_cache`` is the host (UVA) tensor shaped
++        ``[blocks, num_kv_heads, page_size, 2 * head_dim]`` and ``arena`` is a
++        GPU tensor of the same dtype whose first dimension is a page count.
++    """
++    num_rows = rows.numel()
++    if num_rows == 0:
++        return
++    assert output_gate.is_contiguous()
++    output_gate_view = output_gate.view_as(q)
++    pages_in_arena = arena.shape[0]
++    page_size = kv_cache.shape[2]
++    head_dim = kv_cache.shape[3] // 2
++    num_kv_heads = kv_cache.shape[1]
++    num_pages = max_logical_page + 1
++    num_buckets = triton.cdiv(num_pages, pages_in_arena)
++
++    group_size = q.shape[1] // num_kv_heads
++    block_m = triton.next_power_of_2(group_size)
++    selection_width = logical_indices.shape[1] - 1
++    block_n, partial_warps, num_tiles, _ = _select_config(
++        num_rows, num_kv_heads, use_prefill_config, selection_width
++    )
++
++    if num_buckets == 1:
++        acc = max_state = norm_state = q
++    else:
++        acc = torch.empty(
++            (num_rows, q.shape[1], q.shape[2]), dtype=torch.float32, device=q.device
++        )
++        max_state = torch.empty(
++            (num_rows, q.shape[1]), dtype=torch.float32, device=q.device
++        )
++        norm_state = torch.empty_like(max_state)
++
++    for bucket in range(num_buckets):
++        page_lo = bucket * pages_in_arena
++        page_hi = min(page_lo + pages_in_arena, num_pages)
++        physical = block_table_row[page_lo:page_hi].to(torch.int64)
++        staged = arena[: page_hi - page_lo]
++        torch.index_select(kv_cache, 0, physical, out=staged)
++        k_arena, v_arena = staged.transpose(1, 2).split(head_dim, dim=-1)
++        _qsa_sparse_staged_gqa_kernel[(num_rows, num_kv_heads)](
++            q,
++            k_arena,
++            v_arena,
++            logical_indices,
++            rows,
++            acc,
++            max_state,
++            norm_state,
++            out,
++            output_gate_view,
++            q.stride(0),
++            q.stride(1),
++            k_arena.stride(0),
++            k_arena.stride(1),
++            k_arena.stride(2),
++            v_arena.stride(0),
++            v_arena.stride(1),
++            v_arena.stride(2),
++            logical_indices.stride(0),
++            out.stride(0),
++            out.stride(1),
++            output_gate_view.stride(0),
++            output_gate_view.stride(1),
++            num_rows,
++            page_lo,
++            page_hi - page_lo,
++            TOPK=selection_width,
++            PAGE_SIZE=page_size,
++            GROUP_SIZE=group_size,
++            HEAD_DIM=q.shape[2],
++            NUM_QUERY_HEADS=q.shape[1],
++            NUM_TILES=num_tiles,
++            BLOCK_M=block_m,
++            BLOCK_N=block_n,
++            FIRST_BUCKET=bucket == 0,
++            LAST_BUCKET=bucket == num_buckets - 1,
++            num_warps=partial_warps,
++            num_stages=2,
++        )
++
++
++_QSA_ARENA_CACHE: dict[tuple, torch.Tensor | None] = {}
++
++
++def qsa_get_staging_arena(
++    kv_cache: torch.Tensor, arena_bytes: int
++) -> torch.Tensor | None:
++    """Return the staging arena shared by all layers on this rank.
++
++    Layers run one after another, so one arena is enough. Its size is rounded
++    down to whole KV blocks, with a minimum of one. If allocation fails, the
++    failure is cached and logged once, and prefill uses the direct path.
++    """
++    page_bytes = kv_cache[0].numel() * kv_cache.element_size()
++    pages = qsa_staged_arena_pages(arena_bytes, page_bytes)
++    key = (kv_cache.device, kv_cache.dtype, pages, tuple(kv_cache.shape[1:]))
++    if key in _QSA_ARENA_CACHE:
++        return _QSA_ARENA_CACHE[key]
++    from vllm.logger import init_logger
++
++    logger = init_logger(__name__)
++    try:
++        arena = torch.empty(
++            (pages, *kv_cache.shape[1:]),
++            dtype=kv_cache.dtype,
++            device=kv_cache.device,
++        )
++    except torch.OutOfMemoryError:
++        arena = None
++        logger.warning(
++            "QSA staging arena of %d blocks (%.0f MiB) does not fit on %s; "
++            "prefill reads host K/V row by row instead, which is several "
++            "times slower. Lower VLLM_QSA_KVO_ARENA or --kv-cache-memory-bytes.",
++            pages, pages * page_bytes / 2**20, kv_cache.device,
++        )
++    else:
++        logger.info(
++            "QSA staging arena: %d blocks x %d tokens, %.0f MiB on %s",
++            pages, kv_cache.shape[2], pages * page_bytes / 2**20, kv_cache.device,
++        )
++    _QSA_ARENA_CACHE[key] = arena
++    return arena
++
++
+ def qsa_sparse_paged_attention(
+     q: torch.Tensor,
+     k_cache: torch.Tensor,
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index b6da89a..6741a1c 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -4,6 +4,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from typing import ClassVar, cast
+ 
+ import torch
+@@ -124,6 +125,182 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
+         return False
+ 
+ 
++_QSA_STAGE_MIN_ROWS = 64
++
++# Default prefill staging arena (see ops/qsa.py). 96 MiB is 4 KV blocks at the
++# 3-card block size. All published numbers were measured with this value.
++_QSA_ARENA_DEFAULT_BYTES = 96 * 1024 * 1024
++
++# Host RAM kept free after each pool is pinned. Pinned pages cannot be swapped
++# or reclaimed.
++_QSA_HOST_RESERVE_BYTES = 4 * 2**30
++
++
++def _qsa_host_ram_available() -> int | None:
++    """Bytes of RAM this process can still pin, or None if it cannot tell."""
++    available = None
++    try:
++        with open("/proc/meminfo") as fh:
++            for line in fh:
++                if line.startswith("MemAvailable:"):
++                    available = int(line.split()[1]) * 1024
++                    break
++    except (OSError, ValueError):
++        pass
++    # A container memory limit (cgroup v2) caps it further. Page cache counts
++    # toward memory.current but can be reclaimed, so add it back.
++    try:
++        with open("/sys/fs/cgroup/memory.max") as fh:
++            limit = fh.read().strip()
++        if limit != "max":
++            with open("/sys/fs/cgroup/memory.current") as fh:
++                used = int(fh.read())
++            with open("/sys/fs/cgroup/memory.stat") as fh:
++                for line in fh:
++                    if line.startswith("file "):
++                        used -= int(line.split()[1])
++                        break
++            room = int(limit) - used
++            available = room if available is None else min(available, room)
++    except (OSError, ValueError):
++        pass
++    return available
++
++
++def _qsa_pin_host_pool(
++    shape: tuple[int, ...], nbytes: int, layer_name: str, pool_layers: int
++) -> tuple[torch.Tensor, object]:
++    """Allocate one layer's host K/V pool and pin exactly ``nbytes``.
++
++    PyTorch's caching host allocator rounds pinned sizes up to a power of two
++    unless pinned_max_round_threshold_mb is set, so a 4.03 GiB pool would pin
++    8 GiB. This uses an anonymous mapping and cudaHostRegister instead. The
++    pools live until the process exits, so no caching is needed.
++
++    All pipeline ranks on the host allocate under one file lock and check the
++    RAM available at that moment. Two ranks cannot both pass the check and
++    then run out of memory together.
++    """
++    import fcntl
++    import mmap
++    import tempfile
++
++    cap = os.environ.get("VLLM_QSA_KV_OFFLOAD_MAX_GIB", "").strip()
++    lock_path = os.path.join(tempfile.gettempdir(), "vllm-qsa-host-kv.lock")
++    with open(lock_path, "a") as lock:
++        fcntl.flock(lock, fcntl.LOCK_EX)
++        if cap:
++            # Fixed limit for all pools of the model. Replaces the RAM check.
++            budget = float(cap) * 2**30
++            if nbytes * pool_layers > budget:
++                raise RuntimeError(
++                    f"QSA host KV pool would need "
++                    f"{nbytes * pool_layers / 2**30:.2f} GiB across "
++                    f"{pool_layers} layers, exceeding "
++                    f"VLLM_QSA_KV_OFFLOAD_MAX_GIB={cap}. Lower "
++                    "--kv-cache-memory-bytes, or unset the variable to check "
++                    "against the free host RAM instead."
++                )
++        else:
++            available = _qsa_host_ram_available()
++            if (
++                available is not None
++                and nbytes + _QSA_HOST_RESERVE_BYTES > available
++            ):
++                raise RuntimeError(
++                    f"QSA host KV: {layer_name} needs {nbytes / 2**30:.2f} GiB "
++                    f"of pinned host RAM ({nbytes * pool_layers / 2**30:.1f} "
++                    f"GiB for all {pool_layers} QSA layers of the model), but "
++                    f"only {available / 2**30:.1f} GiB is available and "
++                    f"{_QSA_HOST_RESERVE_BYTES / 2**30:g} GiB is kept free. "
++                    "Lower --kv-cache-memory-bytes: host RAM, not VRAM, is what "
++                    "it buys here. Set VLLM_QSA_KV_OFFLOAD_MAX_GIB to replace "
++                    "this check with a fixed limit."
++                )
++        buf = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
++        if hasattr(mmap, "MADV_HUGEPAGE"):
++            try:
++                buf.madvise(mmap.MADV_HUGEPAGE)
++            except OSError:
++                pass
++        host = torch.frombuffer(buf, dtype=torch.bfloat16).view(shape)
++        err = torch.cuda.cudart().cudaHostRegister(host.data_ptr(), nbytes, 0)
++        if err.value != 0:
++            raise RuntimeError(
++                f"QSA host KV: cudaHostRegister of {nbytes / 2**30:.2f} GiB "
++                f"for {layer_name} failed ({err}). The container needs an "
++                "unlimited memlock ulimit."
++            )
++    return host, buf
++
++
++def _qsa_staged_prefill(
++    layer,
++    query,
++    kv_cache,
++    logical_indices,
++    attn_metadata,
++    token_to_req,
++    num_tokens,
++    use_prefill_config,
++    output,
++    output_gate,
++):
++    """Serve prefill rows from host-resident K/V through a staging arena.
++
++    Returns the ``(start, end)`` row range it handled, or None if the whole
++    batch should use the direct path. Only the contiguous rows of one request
++    can be staged. In a mixed batch the largest request is staged and the
++    other rows use the direct path.
++    """
++    if not getattr(layer, "_qsa_kv_offload", False):
++        return None
++    if getattr(layer, "_qsa_stage_arena_bytes", 0) <= 0:
++        return None
++    min_rows = getattr(layer, "_qsa_stage_min_rows", 0)
++    if min_rows <= 0 or num_tokens < min_rows:
++        return None
++    starts = getattr(attn_metadata, "query_start_loc", None)
++    seq_lens = getattr(attn_metadata, "seq_lens", None)
++    if starts is None or seq_lens is None:
++        return None
++    num_requests = int(seq_lens.shape[0])
++    if num_requests < 1 or starts.shape[0] < num_requests + 1:
++        return None
++    offsets = starts[: num_requests + 1].tolist()
++    lengths = seq_lens[:num_requests].tolist()
++    best = max(range(num_requests), key=lambda i: offsets[i + 1] - offsets[i])
++    start, end = offsets[best], offsets[best + 1]
++    if end - start < min_rows or end > num_tokens:
++        return None
++
++    from .ops.qsa import qsa_get_staging_arena, qsa_sparse_paged_attention_staged
++
++    arena = qsa_get_staging_arena(
++        kv_cache, getattr(layer, "_qsa_stage_arena_bytes", 0)
++    )
++    if arena is None:
++        return None
++    page_size = kv_cache.shape[2]
++    max_logical_page = (max(int(lengths[best]), 1) - 1) // page_size
++    if max_logical_page >= attn_metadata.block_table.shape[1]:
++        return None
++    rows = torch.arange(start, end, device=query.device, dtype=torch.int64)
++    qsa_sparse_paged_attention_staged(
++        query[:num_tokens],
++        kv_cache,
++        logical_indices,
++        attn_metadata.block_table[best],
++        rows,
++        max_logical_page,
++        arena,
++        use_prefill_config,
++        output[:num_tokens],
++        output_gate=output_gate[:num_tokens],
++    )
++    return start, end
++
++
+ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+     """Run paged sparse GQA with the QSA Triton kernel."""
+ 
+@@ -233,19 +410,49 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+ 
+         from .ops.qsa import qsa_sparse_paged_attention
+ 
+-        qsa_sparse_paged_attention(
+-            query[:num_tokens],
+-            key_cache,
+-            value_cache,
++        staged = _qsa_staged_prefill(
++            layer,
++            query,
++            kv_cache,
+             logical_indices,
+-            attn_metadata.block_table,
++            attn_metadata,
+             token_to_req,
++            num_tokens,
+             use_prefill_config,
+-            output[:num_tokens],
+-            k_scale=k_scale,
+-            v_scale=v_scale,
+-            output_gate=output_gate[:num_tokens],
++            output,
++            output_gate,
+         )
++        if staged is None:
++            qsa_sparse_paged_attention(
++                query[:num_tokens],
++                key_cache,
++                value_cache,
++                logical_indices,
++                attn_metadata.block_table,
++                token_to_req,
++                use_prefill_config,
++                output[:num_tokens],
++                k_scale=k_scale,
++                v_scale=v_scale,
++                output_gate=output_gate[:num_tokens],
++            )
++            return output
++        staged_start, staged_end = staged
++        for low, high in ((0, staged_start), (staged_end, num_tokens)):
++            if high > low:
++                qsa_sparse_paged_attention(
++                    query[low:high],
++                    key_cache,
++                    value_cache,
++                    logical_indices[low:high],
++                    attn_metadata.block_table,
++                    token_to_req[low:high],
++                    use_prefill_config,
++                    output[low:high],
++                    k_scale=k_scale,
++                    v_scale=v_scale,
++                    output_gate=output_gate[low:high],
++                )
+         return output
+ 
+ 
+@@ -384,6 +591,26 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+             )
+         self.kv_sharing_target_layer_name = None
+         self.kv_cache = torch.tensor([])
++        self._qsa_kv_offload = os.environ.get("VLLM_QSA_KV_OFFLOAD", "0") == "1"
++        self._qsa_host_kv = None
++        self._qsa_host_buf = None
++        self._qsa_offload_layers = sum(
++            kind in ("full_attention", "qwen_sparse_attention")
++            for kind in config.layer_types
++        )
++        if self._qsa_kv_offload:
++            if vllm_config.speculative_config is not None:
++                raise NotImplementedError(
++                    "QSA host KV currently requires no speculation"
++                )
++            if vllm_config.parallel_config.tensor_parallel_size != 1:
++                raise NotImplementedError("QSA host KV currently requires TP=1")
++        self._qsa_stage_min_rows = _QSA_STAGE_MIN_ROWS
++        # 0 turns staging off, and every prefill row then reads host K/V
++        # directly (about 4x slower prefill at long context).
++        self._qsa_stage_arena_bytes = int(
++            os.environ.get("VLLM_QSA_KVO_ARENA", str(_QSA_ARENA_DEFAULT_BYTES))
++        )
+         set_default_quant_scales(self, register_buffer=True)
+ 
+         self.attn_backend = Qwen4ExpQSAFlashAttentionBackend
+@@ -439,8 +666,46 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+             head_size_v=self.head_dim,
+             dtype=self.kv_cache_torch_dtype,
+             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
++            num_head_slots=1 if self._qsa_kv_offload else None,
++            state_content_bytes=2 if self._qsa_kv_offload else None,
+         )
+ 
++    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
++        if not self._qsa_kv_offload:
++            super().bind_kv_cache(kv_cache)
++            return
++        from vllm.logger import init_logger
++        from vllm.utils.platform_utils import is_uva_available
++        from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
++
++        if not is_uva_available():
++            raise RuntimeError("QSA host KV requires CUDA UVA")
++        if kv_cache.ndim != 4 or kv_cache.shape[1] != 1 or kv_cache.shape[3] != 1:
++            raise ValueError("QSA host KV expected [blocks, 1, tokens, 1] GPU slots")
++        num_blocks, _, block_size, _ = kv_cache.shape
++        shape = (num_blocks, self.num_kv_heads, block_size, 2 * self.head_dim)
++        layer_bytes = (
++            num_blocks * self.num_kv_heads * block_size * 2 * self.head_dim * 2
++        )
++        self._qsa_host_kv, self._qsa_host_buf = _qsa_pin_host_pool(
++            shape, layer_bytes, self.layer_name, self._qsa_offload_layers
++        )
++        self._qsa_gpu_slots = kv_cache
++        self.kv_cache = get_accelerator_view_from_cpu_tensor(self._qsa_host_kv)
++        init_logger(__name__).info(
++            "QSA host KV %s: %d blocks x %d tokens, %.3f GiB pinned (UVA), "
++            "%.1f GiB for all %d QSA layers",
++            self.layer_name, num_blocks, block_size, layer_bytes / 2**30,
++            layer_bytes * self._qsa_offload_layers / 2**30,
++            self._qsa_offload_layers,
++        )
++        if self._qsa_stage_arena_bytes > 0:
++            # Allocate the arena now while GPU memory is free, not at the first
++            # long prefill.
++            from .ops.qsa import qsa_get_staging_arena
++
++            qsa_get_staging_arena(self.kv_cache, self._qsa_stage_arena_bytes)
++
+     @eager_break_during_capture
+     def _run_qsa(
+         self,
+diff --git a/vllm/platforms/__pycache__/interface.cpython-312.pyc b/vllm/platforms/__pycache__/interface.cpython-312.pyc
+new file mode 100644
+index 0000000..1af20ca
+Binary files /dev/null and b/vllm/platforms/__pycache__/interface.cpython-312.pyc differ
+diff --git a/vllm/platforms/interface.py b/vllm/platforms/interface.py
+index 5b053c4..28991a8 100644
+--- a/vllm/platforms/interface.py
++++ b/vllm/platforms/interface.py
+@@ -66,6 +66,43 @@ def in_wsl() -> bool:
+     return "microsoft" in " ".join(platform.uname()).lower()
+ 
+ 
++def _qsa_offload_bytes_per_token_per_layer(vllm_config: "VllmConfig") -> int:
++    """GPU-resident bytes per token per full-attention layer under QSA offload.
++
++    The main K/V is on the host. The GPU keeps a 2-byte slot and the pooled
++    index key of ``indexer_kv_heads * (indexer_head_dim //
++    indexer_compress_ratio)`` elements.
++    """
++    text_config = vllm_config.model_config.hf_text_config
++    head_dim = getattr(text_config, "indexer_head_dim", 0)
++    ratio = getattr(text_config, "indexer_compress_ratio", 0)
++    heads = getattr(text_config, "indexer_kv_heads", 1)
++    if not head_dim or not ratio:
++        raise ValueError("QSA offload needs indexer_head_dim/indexer_compress_ratio")
++    dtype_size = vllm_config.model_config.dtype.itemsize
++    return 2 + heads * (head_dim // ratio) * dtype_size
++
++
++def _qsa_offload_block_size(vllm_config: "VllmConfig", mamba_page_size: int):
++    """Attention block size for QSA offload, or None to keep the normal path."""
++    import os
++
++    if os.environ.get("VLLM_QSA_KV_OFFLOAD", "0") != "1":
++        return None
++    text_config = vllm_config.model_config.hf_text_config
++    layer_types = getattr(text_config, "layer_types", None)
++    if not layer_types or mamba_page_size <= 0:
++        return None
++    full_attention = sum(kind == "full_attention" for kind in layer_types)
++    if not full_attention:
++        return None
++    pp_size = vllm_config.parallel_config.pipeline_parallel_size
++    layers_per_rank = max(1, full_attention // pp_size)
++    per_token = layers_per_rank * _qsa_offload_bytes_per_token_per_layer(vllm_config)
++    block_size = (mamba_page_size // per_token) // 16 * 16
++    return block_size if block_size >= 16 else None
++
++
+ class PlatformEnum(enum.Enum):
+     """Enumeration of supported hardware platforms."""
+ 
+@@ -984,6 +1021,21 @@ class Platform:
+             if indexer_align:
+                 attn_block_size = indexer_align * cdiv(attn_block_size, indexer_align)
+ 
++        qsa_block_size = _qsa_offload_block_size(vllm_config, mamba_page_size)
++        if qsa_block_size is not None:
++            cache_config.block_size = qsa_block_size
++            if cache_config.mamba_cache_mode == "align":
++                cache_config.mamba_block_size = qsa_block_size
++            cache_config.mamba_page_size_padded = mamba_page_size
++            logger.info(
++                "QSA host-KV offload: attention block size %d tokens "
++                "(GPU-resident %d B/token/layer, mamba page %d B).",
++                qsa_block_size,
++                _qsa_offload_bytes_per_token_per_layer(vllm_config),
++                mamba_page_size,
++            )
++            return
++
+         if cache_config.block_size < attn_block_size:
+             cache_config.block_size = attn_block_size
+             logger.info(
+diff --git a/vllm/v1/core/__pycache__/kv_cache_utils.cpython-312.pyc b/vllm/v1/core/__pycache__/kv_cache_utils.cpython-312.pyc
+new file mode 100644
+index 0000000..39119b3
+Binary files /dev/null and b/vllm/v1/core/__pycache__/kv_cache_utils.cpython-312.pyc differ
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 8fc327f..421169c 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1788,8 +1788,12 @@ def get_kv_cache_config_from_groups(
+         group_spec = group.kv_cache_spec
+         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
+         if isinstance(group_spec, UniformTypeKVCacheSpecs):
++            # kv_cache_specs lists the layers of all pipeline ranks. Keep only
++            # this group's layers on this rank, which can be none.
++            owned = set(group.layer_names)
+             for layer_name, spec in group_spec.kv_cache_specs.items():
+-                layers_by_spec[spec].append(layer_name)
++                if layer_name in owned:
++                    layers_by_spec[spec].append(layer_name)
+         elif group.layer_names:
+             layers_by_spec[group_spec].extend(group.layer_names)
+ 

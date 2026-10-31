@@ -1,0 +1,424 @@
+diff -ruN a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py	2026-10-28 23:13:19.596123040 +0700
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py	2026-10-28 23:13:19.601123036 +0700
+@@ -847,9 +847,19 @@
+     output_gate: torch.Tensor,
+     k_scale: float | None = None,
+     v_scale: float | None = None,
++    host_kv: torch.Tensor | None = None,
++    physical_pages: list[int] | None = None,
++    prefetched_pages: int = 0,
+ ) -> None:
+     """Run the rows in ``rows`` against host-resident K/V via the arena.
+ 
++    local-50: with ``host_kv`` (the pinned CPU pool behind ``kv_cache``) and
++    ``physical_pages`` (the request's block ids on the host) each bucket is
++    filled with cudaMemcpyAsync, i.e. by the copy engine, instead of an
++    index_select kernel reading host memory through UVA. The first
++    ``prefetched_pages`` pages of bucket 0 are already in the arena
++    (qsa_prefetch_arena).
++
+     Caller contract (use the direct path when it cannot be met):
+       * ``rows`` belongs to a single request and ``block_table_row`` is that
+         request's block table row.
+@@ -900,9 +910,15 @@
+     for bucket in range(num_buckets):
+         page_lo = bucket * pages_in_arena
+         page_hi = min(page_lo + pages_in_arena, num_pages)
+-        physical = block_table_row[page_lo:page_hi].to(torch.int64)
+         staged = arena[: page_hi - page_lo]
+-        torch.index_select(kv_cache, 0, physical, out=staged)
++        if host_kv is not None and physical_pages is not None:
++            first = prefetched_pages if bucket == 0 else 0
++            qsa_copy_pages(
++                arena, first, host_kv, physical_pages[page_lo + first : page_hi]
++            )
++        else:
++            physical = block_table_row[page_lo:page_hi].to(torch.int64)
++            torch.index_select(kv_cache, 0, physical, out=staged)
+         k_arena, v_arena = staged.transpose(1, 2).split(head_dim, dim=-1)
+         _qsa_sparse_staged_gqa_kernel[(num_rows, num_kv_heads)](
+             q,
+@@ -950,6 +966,100 @@
+         )
+ 
+ 
++def qsa_copy_pages(
++    arena: torch.Tensor,
++    first_slot: int,
++    host_kv: torch.Tensor,
++    physical_pages: list[int],
++) -> None:
++    """Copy host pages into consecutive arena slots from ``first_slot`` on.
++
++    Runs of consecutive block ids become one cudaMemcpyAsync each, on the
++    current stream. ``host_kv`` is pinned (cudaHostRegister), so the copies go
++    through the copy engine and leave the SMs to the kernels around them.
++    """
++    slot = first_slot
++    index = 0
++    count = len(physical_pages)
++    while index < count:
++        start = physical_pages[index]
++        run = 1
++        while index + run < count and physical_pages[index + run] == start + run:
++            run += 1
++        arena[slot : slot + run].copy_(host_kv[start : start + run], non_blocking=True)
++        slot += run
++        index += run
++
++
++# local-50: copies of the next QSA layer's leading pages, made on a side
++# stream while the layers between the two QSA layers compute. One per device.
++_QSA_COPY_STREAMS: dict[torch.device, torch.cuda.Stream] = {}
++_QSA_PREFETCH: dict[torch.device, dict] = {}
++
++
++def qsa_prefetch_arena(
++    arena: torch.Tensor,
++    layer_name: str,
++    host_kv: torch.Tensor,
++    physical_pages: list[int],
++) -> None:
++    """Start copying ``physical_pages`` of ``layer_name`` into arena slot 0..n.
++
++    The copy waits for everything queued on the current stream so far, which
++    includes the last kernel that reads the arena. qsa_prefetch_take() must run
++    before anything else touches the arena.
++    """
++    device = arena.device
++    qsa_prefetch_fence(device)
++    if not physical_pages:
++        return
++    stream = _QSA_COPY_STREAMS.get(device)
++    if stream is None:
++        stream = torch.cuda.Stream(device=device)
++        _QSA_COPY_STREAMS[device] = stream
++    ready = torch.cuda.Event()
++    ready.record(torch.cuda.current_stream(device))
++    with torch.cuda.stream(stream):
++        stream.wait_event(ready)
++        qsa_copy_pages(arena, 0, host_kv, physical_pages)
++        done = torch.cuda.Event()
++        done.record(stream)
++    _QSA_PREFETCH[device] = {
++        "arena": arena.data_ptr(),
++        "layer": layer_name,
++        "pages": tuple(physical_pages),
++        "done": done,
++    }
++
++
++def qsa_prefetch_fence(device: torch.device) -> None:
++    """Order a pending prefetch before later work on the current stream."""
++    pending = _QSA_PREFETCH.pop(device, None)
++    if pending is not None:
++        torch.cuda.current_stream(device).wait_event(pending["done"])
++
++
++def qsa_prefetch_take(
++    arena: torch.Tensor, layer_name: str, physical_pages: list[int]
++) -> int:
++    """Fence a pending prefetch; return how many leading pages it already put
++    in the arena for this layer and request (0 if it was for something else).
++    """
++    device = arena.device
++    pending = _QSA_PREFETCH.get(device)
++    if pending is None:
++        return 0
++    qsa_prefetch_fence(device)
++    pages = pending["pages"]
++    if (
++        pending["arena"] != arena.data_ptr()
++        or pending["layer"] != layer_name
++        or tuple(physical_pages[: len(pages)]) != pages
++    ):
++        return 0
++    return len(pages)
++
++
+ _QSA_ARENA_CACHE: dict[tuple, torch.Tensor | None] = {}
+ 
+ 
+@@ -1819,7 +1929,13 @@
+     _PLAN_BLOCK = 256
+     _INVALIDATE_BLOCK = 256
+ 
+-    def __init__(self, arena: torch.Tensor, num_layers: int):
++    def __init__(
++        self, arena: torch.Tensor, num_layers: int, owns_memory: bool = False
++    ):
++        # local-50: True when the rows live in a buffer of their own
++        # (qsa_get_own_row_cache) rather than in the staging arena, so staged
++        # prefills leave them alone.
++        self.owns_memory = owns_memory
+         pages, num_kv_heads, page_size, row_width = arena.shape
+         self.num_layers = num_layers
+         self.num_kv_heads = num_kv_heads
+@@ -1894,6 +2010,59 @@
+     return cache
+ 
+ 
++_QSA_OWN_ROW_CACHES: dict[torch.device, QSARowCache | None] = {}
++
++
++def qsa_get_own_row_cache(
++    kv_cache: torch.Tensor, cache_bytes: int, num_layers: int
++) -> QSARowCache | None:
++    """local-50: the decode row cache in a VRAM buffer of its own (one per rank).
++
++    The arena-backed cache loses every row at each staged prefill, so decodes
++    running next to a long prefill read all their rows from host memory again.
++    None if the buffer holds fewer than _QSA_ROW_CACHE_MIN_SLOTS rows per layer
++    or does not fit.
++    """
++    device = kv_cache.device
++    if device in _QSA_OWN_ROW_CACHES:
++        return _QSA_OWN_ROW_CACHES[device]
++    from vllm.logger import init_logger
++
++    logger = init_logger(__name__)
++    num_kv_heads, row_width = kv_cache.shape[1], kv_cache.shape[3]
++    row_bytes = num_kv_heads * row_width * kv_cache.element_size()
++    rows = cache_bytes // max(row_bytes, 1)
++    cache = None
++    if num_layers >= 1 and rows // num_layers >= _QSA_ROW_CACHE_MIN_SLOTS:
++        try:
++            buffer = torch.empty(
++                (1, num_kv_heads, rows, row_width),
++                dtype=kv_cache.dtype,
++                device=device,
++            )
++        except torch.OutOfMemoryError:
++            logger.warning(
++                "QSA own row cache of %.0f MiB does not fit on %s; decode reads "
++                "host K/V directly.", cache_bytes / 2**20, device,
++            )
++        else:
++            cache = QSARowCache(buffer, num_layers, owns_memory=True)
++            _QSA_ROW_CACHES[buffer.data_ptr()] = cache
++            logger.info(
++                "QSA own row cache: %d rows per layer for %d layers, %.0f MiB "
++                "on %s", cache.num_slots, num_layers,
++                buffer.numel() * buffer.element_size() / 2**20, device,
++            )
++    else:
++        logger.warning(
++            "QSA own row cache of %.0f MiB holds fewer than %d rows per layer "
++            "for %d layers on %s; not used.",
++            cache_bytes / 2**20, _QSA_ROW_CACHE_MIN_SLOTS, num_layers, device,
++        )
++    _QSA_OWN_ROW_CACHES[device] = cache
++    return cache
++
++
+ def qsa_sparse_paged_attention_cached(
+     q: torch.Tensor,
+     k_cache: torch.Tensor,
+diff -ruN a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py	2026-10-28 23:13:19.598123038 +0700
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py	2026-10-28 23:13:19.603123034 +0700
+@@ -142,6 +142,17 @@
+ # direct path; their K/V writes still drop cached rows.
+ _QSA_ROW_CACHE_MAX_ROWS = 12
+ 
++# local-50 (1): fill the staging arena with copy-engine transfers from the
++# pinned pool and copy the next QSA layer's leading pages while the layers in
++# between compute. 0 = the index_select path (= l49).
++_QSA_CE_COPY = os.environ.get("VLLM_QSA_CE_COPY", "0").strip() == "1"
++# local-50 (3): MiB of VRAM for a decode row cache of its own instead of the
++# one inside the staging arena, so staged prefills no longer drop it and the
++# decode rows of a mixed prefill step can use it too. 0 = the arena cache.
++_QSA_ROW_CACHE_OWN_BYTES = int(
++    float(os.environ.get("VLLM_QSA_ROW_CACHE_OWN_MB", "0") or 0) * 2**20
++)
++
+ # Host RAM kept free after each pool is pinned. Pinned pages cannot be swapped
+ # or reclaimed.
+ _QSA_HOST_RESERVE_BYTES = 4 * 2**30
+@@ -251,6 +262,32 @@
+ 
+ # Host K/V views (UVA) of the QSA layers on this rank, by layer name.
+ _QSA_HOST_KV_VIEWS: dict[str, torch.Tensor] = {}
++# local-50: the pinned CPU pools behind those views, by layer name.
++_QSA_HOST_KV_CPU: dict[str, torch.Tensor] = {}
++
++
++def _qsa_layer_order_key(name: str) -> tuple[str, int] | None:
++    import re
++
++    match = re.search(r"layers\.(\d+)\.", name)
++    if match is None:
++        return None
++    return name[: match.start()] + name[match.end() :], int(match.group(1))
++
++
++def _qsa_next_host_layer(name: str) -> str | None:
++    """The next host-KV QSA layer of the same stack on this rank, if any."""
++    key = _qsa_layer_order_key(name)
++    if key is None:
++        return None
++    best = None
++    for other in _QSA_HOST_KV_CPU:
++        other_key = _qsa_layer_order_key(other)
++        if other_key is None or other_key[0] != key[0] or other_key[1] <= key[1]:
++            continue
++        if best is None or other_key[1] < best[1]:
++            best = (other, other_key[1])
++    return None if best is None else best[0]
+ _QSA_COW_UNMAPPED_WARNED = False
+ 
+ 
+@@ -356,8 +393,26 @@
+     num_requests = int(seq_lens.shape[0])
+     if num_requests < 1 or starts.shape[0] < num_requests + 1:
+         return None
+-    offsets = starts[: num_requests + 1].tolist()
+-    lengths = seq_lens[:num_requests].tolist()
++    host_kv = _QSA_HOST_KV_CPU.get(layer.layer_name) if _QSA_CE_COPY else None
++    block_rows = None
++    if host_kv is not None:
++        # One device-to-host read for offsets, lengths and block ids.
++        table = attn_metadata.block_table[:num_requests]
++        width = int(table.shape[1])
++        values = torch.cat(
++            (
++                starts[: num_requests + 1].to(torch.int64),
++                seq_lens[:num_requests].to(torch.int64),
++                table.reshape(-1).to(torch.int64),
++            )
++        ).tolist()
++        offsets = values[: num_requests + 1]
++        lengths = values[num_requests + 1 : 2 * num_requests + 1]
++        flat = values[2 * num_requests + 1 :]
++        block_rows = [flat[i * width : (i + 1) * width] for i in range(num_requests)]
++    else:
++        offsets = starts[: num_requests + 1].tolist()
++        lengths = seq_lens[:num_requests].tolist()
+     best = max(range(num_requests), key=lambda i: offsets[i + 1] - offsets[i])
+     start, end = offsets[best], offsets[best + 1]
+     if end - start < min_rows or end > num_tokens:
+@@ -375,6 +430,12 @@
+     if max_logical_page >= attn_metadata.block_table.shape[1]:
+         return None
+     rows = torch.arange(start, end, device=query.device, dtype=torch.int64)
++    physical_pages = prefetched = None
++    if block_rows is not None:
++        from .ops.qsa import qsa_prefetch_take
++
++        physical_pages = block_rows[best][: max_logical_page + 1]
++        prefetched = qsa_prefetch_take(arena, layer.layer_name, physical_pages)
+     qsa_sparse_paged_attention_staged(
+         query[:num_tokens],
+         kv_cache,
+@@ -388,7 +449,26 @@
+         output_gate=output_gate[:num_tokens],
+         k_scale=layer._k_scale_float,
+         v_scale=layer._v_scale_float,
++        host_kv=host_kv,
++        physical_pages=physical_pages,
++        prefetched_pages=prefetched or 0,
+     )
++    if physical_pages is not None:
++        next_layer = _qsa_next_host_layer(layer.layer_name)
++        if next_layer is not None:
++            # The next layer writes this chunk's K/V before it attends, so
++            # only pages wholly before the chunk can be copied ahead.
++            done_pages = (int(lengths[best]) - (end - start)) // page_size
++            count = min(done_pages, arena.shape[0], len(physical_pages))
++            if count > 0:
++                from .ops.qsa import qsa_prefetch_arena
++
++                qsa_prefetch_arena(
++                    arena,
++                    next_layer,
++                    _QSA_HOST_KV_CPU[next_layer],
++                    physical_pages[:count],
++                )
+     return start, end
+ 
+ 
+@@ -514,6 +594,12 @@
+             output_gate,
+         )
+         row_cache = getattr(layer, "_qsa_row_cache", None)
++        if staged is None and _QSA_CE_COPY:
++            # A prefetch for this layer that it did not consume still writes
++            # the arena (local-50).
++            from .ops.qsa import qsa_prefetch_fence
++
++            qsa_prefetch_fence(query.device)
+         if staged is None:
+             if row_cache is not None and num_tokens <= _QSA_ROW_CACHE_MAX_ROWS:
+                 from .ops.qsa import qsa_sparse_paged_attention_cached
+@@ -548,12 +634,33 @@
+                 output_gate=output_gate[:num_tokens],
+             )
+             return output
+-        if row_cache is not None:
++        own_cache = row_cache is not None and row_cache.owns_memory
++        if row_cache is not None and not own_cache:
+             # Staging overwrote the arena that holds the cached rows.
+             row_cache.invalidate_all()
+         staged_start, staged_end = staged
+         for low, high in ((0, staged_start), (staged_end, num_tokens)):
+-            if high > low:
++            if high > low and own_cache and high - low <= _QSA_ROW_CACHE_MAX_ROWS:
++                # Decode rows next to a staged prefill (local-50). The decode
++                # launch configuration, which the graph captures already built.
++                from .ops.qsa import qsa_sparse_paged_attention_cached
++
++                qsa_sparse_paged_attention_cached(
++                    query[low:high],
++                    key_cache,
++                    value_cache,
++                    logical_indices[low:high],
++                    attn_metadata.block_table,
++                    token_to_req[low:high],
++                    False,
++                    output[low:high],
++                    row_cache,
++                    layer._qsa_row_cache_index,
++                    output_gate=output_gate[low:high],
++                    k_scale=k_scale,
++                    v_scale=v_scale,
++                )
++            elif high > low:
+                 qsa_sparse_paged_attention(
+                     query[low:high],
+                     key_cache,
+@@ -845,6 +952,7 @@
+         self._qsa_gpu_slots = kv_cache
+         self.kv_cache = get_accelerator_view_from_cpu_tensor(self._qsa_host_kv)
+         _QSA_HOST_KV_VIEWS[self.layer_name] = self.kv_cache
++        _QSA_HOST_KV_CPU[self.layer_name] = self._qsa_host_kv
+         from vllm.v1.worker.utils import KV_CACHE_BLOCK_COPY_HOOKS
+ 
+         if _qsa_copy_host_kv_blocks not in KV_CACHE_BLOCK_COPY_HOOKS:
+@@ -872,15 +980,22 @@
+             arena = qsa_get_staging_arena(
+                 self.kv_cache, self._qsa_stage_arena_bytes
+             )
+-            if arena is not None and os.environ.get(
+-                _QSA_ROW_CACHE_ENV, "1"
+-            ).strip() not in ("", "0"):
++            if (
++                arena is not None or _QSA_ROW_CACHE_OWN_BYTES > 0
++            ) and os.environ.get(_QSA_ROW_CACHE_ENV, "1").strip() not in ("", "0"):
+                 layers_on_rank = sum(
+                     isinstance(module, Qwen4ExpQSAAttention)
+                     and module._qsa_kv_offload
+                     for module in self._qsa_static_context.values()
+                 )
+-                row_cache = qsa_get_row_cache(arena, layers_on_rank)
++                if _QSA_ROW_CACHE_OWN_BYTES > 0:
++                    from .ops.qsa import qsa_get_own_row_cache
++
++                    row_cache = qsa_get_own_row_cache(
++                        self.kv_cache, _QSA_ROW_CACHE_OWN_BYTES, layers_on_rank
++                    )
++                else:
++                    row_cache = qsa_get_row_cache(arena, layers_on_rank)
+                 if row_cache is not None:
+                     self._qsa_row_cache_index = row_cache.add_layer(self.layer_name)
+                     if self._qsa_row_cache_index is not None:

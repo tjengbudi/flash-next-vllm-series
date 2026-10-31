@@ -1,0 +1,75 @@
+If you would like to merge this patch upstream, I would appreciate it if you could keep me credited as the commit author, or add the following trailer to the commit message: 
+
+Co-authored-by: Minachist <84688797+aiueonicked@users.noreply.github.com>
+
+Qwen3.8-Flash-Next memory patch 01: embed_tokens and lm_head only where used.
+
+vllm/models/qwen4_exp/nvidia/model.py
+
+Qwen4ExpModel built embed_tokens and Qwen4ExpForCausalLM built lm_head on
+every pipeline rank. Only the first rank embeds tokens and only the last rank
+computes logits, so with PP=3 each rank carried an unused INT8 copy of one or
+both 248320 x 2560 tables, 0.60 GiB each. They are now PPMissingLayer on the
+other ranks, as in the other vLLM models. The weights loaded per rank on
+3 x RTX 3090 go from 21.58 / 21.55 / 21.55 to 20.98 / 20.44 / 21.05 GiB, and
+nothing is computed differently.
+
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index 7c79b90..2f18a73 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -58,6 +58,7 @@ from vllm.model_executor.models.qwen3_vl import (
+ )
+ from vllm.model_executor.models.utils import (
+     AutoWeightsLoader,
++    PPMissingLayer,
+     StageMissingLayer,
+     WeightsMapper,
+     _merge_multimodal_embeddings,
+@@ -1028,12 +1029,17 @@ class Qwen4ExpModel(nn.Module):
+                 and getattr(config, "indexer_n_heads", None) is not None
+             )
+         )
+-        self.embed_tokens = VocabParallelEmbedding(
+-            self.vocab_size,
+-            config.hidden_size,
+-            quant_config=vllm_config.quant_config,
+-            prefix=maybe_prefix(prefix, "embed_tokens"),
+-        )
++        # Only the first PP rank embeds tokens; later ranks would hold an
++        # unused 0.6 GiB copy of the (quantized) table.
++        if get_pp_group().is_first_rank:
++            self.embed_tokens = VocabParallelEmbedding(
++                self.vocab_size,
++                config.hidden_size,
++                quant_config=vllm_config.quant_config,
++                prefix=maybe_prefix(prefix, "embed_tokens"),
++            )
++        else:
++            self.embed_tokens = PPMissingLayer()
+ 
+         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
+             layer_idx = extract_layer_index(prefix)
+@@ -1303,12 +1309,16 @@ class Qwen4ExpForCausalLM(
+         self.model = Qwen4ExpModel(
+             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+         )
+-        self.lm_head = ParallelLMHead(
+-            config.vocab_size,
+-            config.hidden_size,
+-            quant_config=self.quant_config,
+-            prefix=maybe_prefix(prefix, "lm_head"),
+-        )
++        # Only the last PP rank computes logits.
++        if get_pp_group().is_last_rank:
++            self.lm_head = ParallelLMHead(
++                config.vocab_size,
++                config.hidden_size,
++                quant_config=self.quant_config,
++                prefix=maybe_prefix(prefix, "lm_head"),
++            )
++        else:
++            self.lm_head = PPMissingLayer()
+         self.logits_processor = LogitsProcessor(config.vocab_size)
+         self.make_empty_intermediate_tensors = (
+             self.model.make_empty_intermediate_tensors

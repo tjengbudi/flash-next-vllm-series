@@ -1,0 +1,149 @@
+# local-03-decode-cpu (budi, 2026-10-07): cut per-token CPU on the critical
+# PP0 rank. Apply after local-02. Both parts have an off switch (env "0").
+#
+# py-spy of single-stream decode (fp8 slug, ~80 tok/s = 12.5 ms/token):
+# Worker_PP0's main thread is never idle (PP1/PP2 wait 19-33% in recv), and
+# spends ~47% building attention metadata and ~28% in the PLE host gather.
+#
+# 1. VLLM_MAMBA_IDX_STEP_CACHE (default 1): Flash-Next has 21 KV-cache groups,
+#    so build_attn_metadata calls the GDN builder ~20x per step, and each call
+#    recomputed the same "align" start indices from the same seq_lens in
+#    mamba_get_block_table_tensor (~24% of PP0). build_attn_metadata now opens
+#    a one-step scope; inside it the indices (and the arange) are computed once
+#    per (seq_lens, block size) and only the per-group gather runs. Never
+#    active during CUDA graph capture. Unit check: identical to the old path.
+# 2. VLLM_PLE_GATHER_ADVISE (default 1): =0 skips only decode-06's per-step
+#    process_madvise (advise_now, ~15% of PP0), keeping the prompt prefetch
+#    thread (VLLM_PLE_PREFETCH). Worth it when the PLE rows are mostly resident
+#    (the fp8 slug leaves ~46 GiB of page cache); misses then fault page by page.
+#
+# Same-boot interleaved A/B 2026-10-07 (runtime switch files, 4 rounds after
+# warm-up, decode 1500 tok single stream): base 78.2, idx cache 82.3
+# (+4.2 tok/s, up in all 4 rounds), advise off 76.0 (one round fell to 67.9 on
+# page faults), both 80.7. Keep VLLM_PLE_GATHER_ADVISE=1. 4-stream aggregate
+# was too noisy (+-13) to rank. The metadata build turned out to overlap the
+# previous token's GPU work; the critical path is PP0's PLE lookup (sync of the
+# sampled ids to the CPU, advise, np.take), which the cache does not touch.
+diff --git a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+index adf567a..20f84a2 100644
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+@@ -606,6 +606,11 @@ _PLE_STORAGE_TORCH_DTYPES = {1: torch.int8, 2: torch.int16, 4: torch.int32}
+ _PLE_PREFETCH_ENV = "VLLM_PLE_PREFETCH"
+ # Gathers up to this many rows (decode batches) advise their pages first.
+ _PLE_GATHER_ADVISE_MAX_ROWS = 256
++# local-03: VLLM_PLE_GATHER_ADVISE=0 skips only the decode-path advise_now
++# (decode-06), keeping the prompt prefetch thread. advise_now is one
++# process_madvise per decode step (~1.9 ms/token on the critical PP0 rank of
++# the ESXi VM); with enough page cache the PLE rows are mostly resident anyway.
++_PLE_GATHER_ADVISE = os.environ.get("VLLM_PLE_GATHER_ADVISE", "1").strip() not in ("", "0")
+ _PLE_PREFETCH_BATCH_ENV = "VLLM_PLE_PREFETCH_BATCH"  # tokens per advise batch
+ 
+ 
+@@ -1091,7 +1096,11 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+             local_ids = np.where(in_range, ids - vocab_start, 0)
+             stage = self._host_stage_np[:count]
+             prefetcher = self._page_prefetcher
+-            if prefetcher is not None and count <= _PLE_GATHER_ADVISE_MAX_ROWS:
++            if (
++                _PLE_GATHER_ADVISE
++                and prefetcher is not None
++                and count <= _PLE_GATHER_ADVISE_MAX_ROWS
++            ):
+                 # Decode: the rows of the token just sampled could not be
+                 # prefetched. Ask for all their pages at once so the faults
+                 # below overlap instead of reading one page at a time.
+diff --git a/vllm/v1/attention/backends/utils.py b/vllm/v1/attention/backends/utils.py
+index ef4f415..6997df8 100644
+--- a/vllm/v1/attention/backends/utils.py
++++ b/vllm/v1/attention/backends/utils.py
+@@ -1156,6 +1156,35 @@ def get_dcp_local_seq_lens(
+     return dcp_local_seq_lens
+ 
+ 
++# local-03 (flash-next): per-step cache for the "align" state-index math.
++# A hybrid model with many KV-cache groups (Flash-Next: 21) builds GDN metadata
++# once per group per step, and every build recomputed the same start indices
++# from the same seq_lens (~5 tiny GPU ops each, ~3 ms/token of CPU on the
++# critical PP rank). build_attn_metadata opens a scope for one step; inside it
++# only the per-group gather runs. VLLM_MAMBA_IDX_STEP_CACHE=0 turns it off.
++_MAMBA_IDX_STEP_CACHE_ON = (
++    __import__("os").environ.get("VLLM_MAMBA_IDX_STEP_CACHE", "1").strip()
++    not in ("", "0")
++)
++_mamba_idx_step_cache: dict | None = None
++_mamba_offsets_cache: dict = {}
++
++
++class mamba_idx_step_scope:
++    """Cache mamba_get_block_table_tensor's indices for one metadata build."""
++
++    def __enter__(self):
++        global _mamba_idx_step_cache
++        if _MAMBA_IDX_STEP_CACHE_ON and not torch.cuda.is_current_stream_capturing():
++            _mamba_idx_step_cache = {}
++        return self
++
++    def __exit__(self, *exc):
++        global _mamba_idx_step_cache
++        _mamba_idx_step_cache = None
++        return False
++
++
+ def mamba_get_block_table_tensor(
+     block_table: torch.Tensor,
+     seq_lens: torch.Tensor,
+@@ -1181,6 +1210,22 @@ def mamba_get_block_table_tensor(
+         return block_table
+     else:
+         assert isinstance(kv_cache_spec, MambaSpec)
++        cache = _mamba_idx_step_cache
++        if cache is not None:
++            n = 1 + kv_cache_spec.num_speculative_blocks
++            key = (id(seq_lens), kv_cache_spec.block_size, n, block_table.device)
++            hit = cache.get(key)
++            if hit is None:
++                okey = (block_table.device, n)
++                offsets = _mamba_offsets_cache.get(okey)
++                if offsets is None:
++                    offsets = torch.arange(n, device=block_table.device, dtype=torch.int32)
++                    _mamba_offsets_cache[okey] = offsets
++                start = (seq_lens - 1) // kv_cache_spec.block_size
++                start.clamp_(min=0)
++                # Keep seq_lens alive with the entry so its id stays unique.
++                hit = cache[key] = (seq_lens, (start.unsqueeze(1) + offsets).to(torch.int64))
++            return torch.gather(block_table, 1, hit[1])
+         # NOTE: For 0-length requests in CUDA graph, use a start_index of 0
+         # to handle the invalid block table.
+         start_indices = (seq_lens - 1) // kv_cache_spec.block_size
+diff --git a/vllm/v1/worker/gpu/attn_utils.py b/vllm/v1/worker/gpu/attn_utils.py
+index 9e9ffd7..76c219a 100644
+--- a/vllm/v1/worker/gpu/attn_utils.py
++++ b/vllm/v1/worker/gpu/attn_utils.py
+@@ -20,7 +20,10 @@ from vllm.v1.attention.backend import (
+     AttentionCGSupport,
+     CommonAttentionMetadata,
+ )
+-from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
++from vllm.v1.attention.backends.utils import (
++    create_fast_prefill_custom_backend,
++    mamba_idx_step_scope,
++)
+ from vllm.v1.hisparse.binding import (
+     init_hisparse_kv_cache,
+     resolve_hisparse_specs,
+@@ -426,7 +429,13 @@ def build_slot_mappings_by_layer(
+     return slot_mappings_by_layer
+ 
+ 
+-def build_attn_metadata(
++def build_attn_metadata(*args, **kwargs) -> dict[str, Any]:
++    """local-03: one step scope so mamba state indices are computed once."""
++    with mamba_idx_step_scope():
++        return _build_attn_metadata_impl(*args, **kwargs)
++
++
++def _build_attn_metadata_impl(
+     attn_groups: list[list[AttentionGroup]],
+     num_reqs: int,
+     num_tokens: int,

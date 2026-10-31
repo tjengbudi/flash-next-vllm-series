@@ -1,0 +1,227 @@
+diff -ru a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+--- a/vllm/v1/worker/gpu/model_runner.py	2026-10-26 23:01:34.000000000 +0700
++++ b/vllm/v1/worker/gpu/model_runner.py	2026-10-27 08:03:06.442641425 +0700
+@@ -2191,7 +2191,10 @@
+             if (
+                 recoverssm := getattr(self.model_state, "recoverssm", None)
+             ) is not None:
+-                self.pp_handler.attach_recoverssm_step(recoverssm.detach_step())
++                detach = getattr(self.model_state, "detach_recoverssm_step", None)
++                self.pp_handler.attach_recoverssm_step(
++                    detach() if detach is not None else recoverssm.detach_step()
++                )
+             # Optimistically update num_computed_tokens for entire batch here.
+             # Will be adjusted for rejections if necessary in update_requests.
+             self.postprocess_num_computed_tokens(input_batch)
+diff -ru a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py	2026-10-26 23:01:34.000000000 +0700
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py	2026-10-27 08:03:06.441641426 +0700
+@@ -3,7 +3,7 @@
+ import os
+ import sys
+ import warnings
+-from dataclasses import dataclass, replace
++from dataclasses import dataclass, fields, replace
+ from typing import Any
+ 
+ import numpy as np
+@@ -54,6 +54,21 @@
+ # RecoverSSM commit (about 4 Triton launches per Mamba group) replays one CUDA
+ # graph recorded with it. VLLM_RECOVERSSM_COMMIT_CG=0 launches them eagerly.
+ _RECOVERSSM_COMMIT_CG = os.environ.get("VLLM_RECOVERSSM_COMMIT_CG", "1") == "1"
++# local-44: on non-last PP ranks the commit is deferred pp_size steps (#59983) and
++# used to clone every commit tensor and launch the commit eagerly (about 36% of
++# PP1's main thread at 3 streams). With this on, a replayed step snapshots its
++# commit tensors into one of pp_size + 1 slot buffers (one recorded graph) and the
++# deferred commit replays a graph recorded on that slot. 0 = clone + eager.
++_RECOVERSSM_PP_CG = os.environ.get("VLLM_RECOVERSSM_PP_CG", "1") == "1"
++
++
++@dataclass(frozen=True)
++class _DeferredRecoverSSMCommit:
++    """local-44: a non-last PP rank's step whose commit tensors sit in slot
++    buffers; postprocess_state replays the slot's commit graph."""
++
++    key: tuple[int, int, int, int]
++    slot: int
+ 
+ 
+ class _KeepPinnedH2D:
+@@ -204,6 +219,13 @@
+         self._rssm_ns: torch.Tensor | None = None
+         self._rssm_idx: torch.Tensor | None = None
+         self._rssm_replay_key: tuple[int, int, int, int] | None = None
++        # local-44: (key, slot) -> (snapshot graph, commit graph, slot step).
++        self._rssm_pp_graphs: dict[
++            tuple[tuple[int, int, int, int], int],
++            tuple[torch.cuda.CUDAGraph, torch.cuda.CUDAGraph, tuple[Any, ...]],
++        ] = {}
++        self._rssm_pp_ring = 0
++        self._rssm_pp_next = 0
+         if self._cg_meta_enabled:
+             # MRV2 stages idx_mapping in a fresh tensor every step; the recorded
+             # build reads it from here instead.
+@@ -398,6 +420,17 @@
+         change per step (num_sampled, idx_mapping) are copied into _rssm_ns and
+         _rssm_idx before the replay."""
+         self._rssm_commit_graphs.clear()
++        self._rssm_pp_graphs.clear()
++        self._rssm_pp_ring = 0
++        pp_slots = 0
++        if _RECOVERSSM_PP_CG:
++            from vllm.distributed import get_pp_group
++
++            pp = get_pp_group()
++            if pp.world_size > 1 and not pp.is_last_rank:
++                # The PP queue holds pp_size slots and a deferred commit runs
++                # before the step that would reuse its slot detaches; one spare.
++                pp_slots = pp.world_size + 1
+         if self._rssm_ns is None:
+             self._rssm_ns = torch.zeros(
+                 self.max_num_reqs, dtype=torch.int32, device=self.device
+@@ -429,12 +462,109 @@
+                 logger.warning(
+                     "local-42: recording RecoverSSM commit %s failed: %r", key, e
+                 )
++            for slot in range(pp_slots):
++                try:
++                    self._record_recoverssm_pp_slot(key, slot, step, n)
++                except Exception as e:  # that key keeps the clone + eager commit
++                    for s in range(pp_slots):
++                        self._rssm_pp_graphs.pop((key, s), None)
++                    logger.warning(
++                        "local-44: recording deferred RecoverSSM commit %s failed: %r",
++                        key,
++                        e,
++                    )
++                    break
++        if pp_slots:
++            self._rssm_pp_ring = pp_slots
+         torch.accelerator.synchronize()
+         self.num_accepted_tokens_gpu.fill_(1)
+         logger.info(
+             "local-42: recorded RecoverSSM commit graphs for %s",
+             sorted(self._rssm_commit_graphs),
+         )
++        if pp_slots:
++            logger.info(
++                "local-44: recorded deferred RecoverSSM commit graphs for %s x %d slots",
++                sorted({k for k, _ in self._rssm_pp_graphs}),
++                pp_slots,
++            )
++
++    def _record_recoverssm_pp_slot(
++        self,
++        key: tuple[int, int, int, int],
++        slot: int,
++        step: tuple[Any, ...],
++        n: int,
++    ) -> None:
++        """local-44: slot buffers for every commit tensor of the recorded step (one
++        buffer per distinct tensor), a graph that copies the recorded tensors into
++        them, and a graph of the deferred commit that reads them."""
++        assert self._rssm_ns is not None and self._rssm_idx is not None
++        bufs: dict[tuple[Any, ...], torch.Tensor] = {}
++        pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
++        slot_step = []
++        for metadata in step:
++            commit = getattr(metadata, "recoverssm_commit", None)
++            if commit is None:
++                slot_step.append(metadata)
++                continue
++            repl = {}
++            for f in fields(commit):
++                v = getattr(commit, f.name)
++                if not isinstance(v, torch.Tensor):
++                    continue
++                k = (v.data_ptr(), v.dtype, tuple(v.shape), v.stride())
++                if k not in bufs:
++                    bufs[k] = torch.empty_like(v)
++                    pairs.append((bufs[k], v))
++                repl[f.name] = bufs[k]
++            slot_step.append(
++                replace(metadata, recoverssm_commit=replace(commit, **repl))
++            )
++        slot_step_t = tuple(slot_step)
++        snap = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(snap, pool=self._cg_meta_pool):
++            for dst, src in pairs:
++                dst.copy_(src)
++        snap.replay()
++        self._rssm_ns.zero_()
++        self._rssm_idx.zero_()
++        # Warm-up as in _record_recoverssm_commits: zero accepted tokens write
++        # no state.
++        self._rssm_commit_deferred(slot_step_t, n)
++        torch.accelerator.synchronize()
++        commit_graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(commit_graph, pool=self._cg_meta_pool):
++            self._rssm_commit_deferred(slot_step_t, n)
++        self._rssm_pp_graphs[(key, slot)] = (snap, commit_graph, slot_step_t)
++
++    def _rssm_commit_deferred(self, step: tuple[Any, ...], n: int) -> None:
++        assert self.recoverssm is not None
++        assert self._rssm_ns is not None and self._rssm_idx is not None
++        # step= takes commit_step's deferred path, which zeroes freed rows.
++        self.recoverssm.commit_step(
++            self._rssm_ns[:n],
++            self._rssm_idx[:n],
++            state_indices=(self._mamba_state_idx_gpu if self._align_mode else None),
++            num_accepted_tokens=self.num_accepted_tokens_gpu,
++            step=step,
++        )
++
++    def detach_recoverssm_step(self) -> Any:
++        """Hand this step's RecoverSSM commit to the PP queue (non-last ranks).
++        local-44: a replayed step snapshots into the next slot (one graph replay);
++        anything else clones its tensors (RecoverSSMState.detach_step)."""
++        assert self.recoverssm is not None
++        key = self._rssm_replay_key
++        if self._rssm_pp_ring and key is not None and self.recoverssm.has_step():
++            slot = self._rssm_pp_next
++            entry = self._rssm_pp_graphs.get((key, slot))
++            if entry is not None:
++                self._rssm_pp_next = (slot + 1) % self._rssm_pp_ring
++                entry[0].replay()
++                self.recoverssm.reset()
++                return _DeferredRecoverSSMCommit(key, slot)
++        return self.recoverssm.detach_step()
+ 
+     def _cg_meta_record_one(
+         self,
+@@ -819,7 +949,34 @@
+                     max(num_sampled, 1),
+                 )
+ 
+-        if self.recoverssm is not None:
++        if self.recoverssm is not None and isinstance(
++            recoverssm_step, _DeferredRecoverSSMCommit
++        ):
++            # local-44: deferred commit of a non-last PP rank from slot buffers.
++            _, commit_graph, slot_step = self._rssm_pp_graphs[
++                (recoverssm_step.key, recoverssm_step.slot)
++            ]
++            n = recoverssm_step.key[0]
++            if (
++                not isinstance(num_sampled, int)
++                and idx_mapping.shape[0] == n
++                and num_sampled.shape[0] >= n
++            ):
++                assert self._rssm_ns is not None and self._rssm_idx is not None
++                self._rssm_ns[:n].copy_(num_sampled[:n], non_blocking=True)
++                self._rssm_idx[:n].copy_(idx_mapping, non_blocking=True)
++                commit_graph.replay()
++            else:
++                self.recoverssm.commit_step(
++                    num_sampled,
++                    idx_mapping,
++                    state_indices=(
++                        self._mamba_state_idx_gpu if self._align_mode else None
++                    ),
++                    num_accepted_tokens=self.num_accepted_tokens_gpu,
++                    step=slot_step,
++                )
++        elif self.recoverssm is not None:
+             key = self._rssm_replay_key
+             self._rssm_replay_key = None
+             graph = (

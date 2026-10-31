@@ -1,0 +1,71 @@
+local-07 (budi, 2026-10-12): staged prefill launch config for sm_86.
+
+Idea from flash-next-qsa-fun-stages.patch (~/patch-qfn3), which exposed the
+staged kernel's num_warps/num_stages as env variables. On sm_86 the default
+table gives a staged prefill chunk (256-512 rows x 2 KV heads) BLOCK_N 64,
+2 warps, 2 stages. Kernel sweep on an RTX 3060 (sm_86, FP8 cache, top-k 2048,
+~98K context, BLOCK_N {32,64,128} x warps {1,2,4,8} x stages {1..4}): BLOCK_N 32
+with 4 warps is 2.1-2.5x faster (512 rows, 1 bucket 15.0 -> 6.3 ms; 3 buckets
+36.7 -> 14.7 ms; 256 rows 8.2 -> 3.9 ms); stages barely matter; BLOCK_N 128
+does not fit sm_86 shared memory. Same accuracy vs an fp64 reference (rel L2
+2.65e-3); max |diff| vs the default 3.9e-3 (BF16 rounding).
+
+Only the staged kernel on compute capability 8.6 changes. Env:
+  VLLM_QSA_STAGED_TUNE=0         default config again
+  VLLM_QSA_STAGED_BLOCK_N/WARPS/STAGES   override one value (32 / 4 / 3)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index f7f78ca..d7cd88e 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -28,6 +28,29 @@ def _is_sm90() -> bool:
+     return current_platform.get_device_capability() == (9, 0)
+ 
+ 
++@lru_cache(maxsize=1)
++def _staged_sm86_config() -> tuple[int, int, int] | None:
++    """(block_n, num_warps, num_stages) for the staged prefill kernel on sm_86.
++
++    local-07 (flash-next). The default table gives a staged prefill chunk of
++    256-512 rows BLOCK_N 64 with 2 warps, which runs at less than half the speed
++    of BLOCK_N 32 with 4 warps on sm_86 (FP8 cache, top-k 2048, ~98K context).
++    VLLM_QSA_STAGED_TUNE=0 restores the default; the three
++    VLLM_QSA_STAGED_{BLOCK_N,WARPS,STAGES} variables override single values.
++    """
++    import os
++
++    if current_platform.get_device_capability() != (8, 6):
++        return None
++    if os.environ.get("VLLM_QSA_STAGED_TUNE", "1") == "0":
++        return None
++    return (
++        int(os.environ.get("VLLM_QSA_STAGED_BLOCK_N", "32")),
++        int(os.environ.get("VLLM_QSA_STAGED_WARPS", "4")),
++        int(os.environ.get("VLLM_QSA_STAGED_STAGES", "3")),
++    )
++
++
+ # FP8-e4m3 main K/V on sm_86 (flash-next local-02). Upstream reads the cache
+ # as float8_e4m3fn and converts it in Triton, which needs the fp8e4nv type that
+ # Triton only has on sm_89+. Here every QSA kernel reads the cache as uint8 and
+@@ -857,6 +880,11 @@ def qsa_sparse_paged_attention_staged(
+     block_n, partial_warps, num_tiles, _ = _select_config(
+         num_rows, num_kv_heads, use_prefill_config, selection_width, is_fp8
+     )
++    num_stages = 2
++    tuned = _staged_sm86_config()
++    if tuned is not None:
++        block_n, partial_warps, num_stages = tuned
++        num_tiles = triton.cdiv(selection_width, block_n)
+ 
+     if num_buckets == 1:
+         acc = max_state = norm_state = q
+@@ -918,7 +946,7 @@ def qsa_sparse_paged_attention_staged(
+             LAST_BUCKET=bucket == num_buckets - 1,
+             IS_FP8=is_fp8,
+             num_warps=partial_warps,
+-            num_stages=2,
++            num_stages=num_stages,
+         )
+ 
+ 

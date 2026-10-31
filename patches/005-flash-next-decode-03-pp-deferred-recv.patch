@@ -1,0 +1,98 @@
+If you would like to merge this patch upstream, I would appreciate it if you could keep me credited as the commit author, or add the following trailer to the commit message: 
+
+Co-authored-by: Minachist <84688797+aiueonicked@users.noreply.github.com>
+
+Qwen3.8-Flash-Next decode patch 03: deferred pipeline-parallel receive.
+
+vllm/v1/worker/gpu_worker.py
+
+On every rank but the first, Worker.execute_model() began with
+irecv_tensor_dict(), whose first step is a blocking receive of the pickled
+tensor metadata over the CPU group. That metadata is sent only after the
+previous rank has launched its forward, so each rank's host-side input and
+attention-metadata preparation (~3 ms of Python on this model) started after
+the previous rank's launch and ended up on the critical path whenever it was
+longer than the previous rank's GPU time. The receive now happens when the
+model runner first reads the intermediate tensors, right before its own
+forward; the order of device operations on the rank is unchanged.
+
+Set VLLM_PP_DEFER_RECV=0 to restore the old order.
+
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 1f34dfe..b4a0a9e 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -179,6 +179,41 @@ class AsyncIntermediateTensors(IntermediateTensors):
+         return object.__getattribute__(self, name)
+ 
+ 
++class DeferredRecvIntermediateTensors(AsyncIntermediateTensors):
++    """AsyncIntermediateTensors that also defers the receive itself.
++
++    ``irecv_tensor_dict`` starts with a blocking receive of the pickled tensor
++    metadata over the CPU group, which only arrives once the previous PP rank
++    has launched its forward. Calling it at the top of ``execute_model`` makes
++    this rank's whole input and attention-metadata preparation wait for that,
++    so on every non-first rank the host preparation runs after the previous
++    rank's launch instead of alongside the previous rank's GPU work. When the
++    per-rank GPU time is short (decode), that host work becomes the step time.
++
++    The model runner only reads ``.tensors`` right before the forward, so the
++    receive is issued there. The order of device operations on this rank is
++    unchanged: receive, forward, send.
++    """
++
++    def __init__(self, recv: Callable[[], tuple]) -> None:
++        super().__init__({})
++        self._recv = recv
++
++    def wait_for_comm(self) -> None:
++        if object.__getattribute__(self, "_comm_waited"):
++            return
++        tensor_dict, handles, postprocess = object.__getattribute__(self, "_recv")()
++        assert tensor_dict is not None
++        object.__setattr__(self, "tensors", tensor_dict)
++        object.__setattr__(self, "_comm_handles", handles)
++        object.__setattr__(self, "_comm_postprocess", postprocess)
++        super().wait_for_comm()
++
++
++def _defer_pp_recv() -> bool:
++    return os.environ.get("VLLM_PP_DEFER_RECV", "1").strip() not in ("", "0")
++
++
+ class Worker(WorkerBase):
+     def __init__(
+         self,
+@@ -1264,7 +1299,20 @@ class Worker(WorkerBase):
+                 )
+             }
+ 
+-        if forward_pass and not get_pp_group().is_first_rank:
++        if (
++            forward_pass
++            and not get_pp_group().is_first_rank
++            and self.use_v2_model_runner
++            and _defer_pp_recv()
++        ):
++            pp_group, tp_group = get_pp_group(), get_tp_group()
++            intermediate_tensors = DeferredRecvIntermediateTensors(
++                lambda: pp_group.irecv_tensor_dict(
++                    all_gather_group=tp_group,
++                    all_gather_tensors=all_gather_tensors,
++                )
++            )
++        elif forward_pass and not get_pp_group().is_first_rank:
+             tensor_dict, comm_handles, comm_postprocess = (
+                 get_pp_group().irecv_tensor_dict(
+                     all_gather_group=get_tp_group(),
+@@ -1282,6 +1330,9 @@ class Worker(WorkerBase):
+             output = self.model_runner.execute_model(
+                 scheduler_output, intermediate_tensors
+             )
++            if isinstance(intermediate_tensors, DeferredRecvIntermediateTensors):
++                # Match the previous rank's send even if nothing read it.
++                intermediate_tensors.wait_for_comm()
+             if (
+                 self.use_v2_model_runner
+                 and self.model_runner.is_pooling_model

@@ -1,0 +1,97 @@
+diff -ru a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -59,8 +59,10 @@
+ from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
+ from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
+ from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
++from vllm.utils.multi_stream_utils import execute_in_parallel
+ from vllm.utils.torch_utils import (
+     LayerNameType,
++    aux_stream,
+     _encode_layer_name,
+     _resolve_layer_name,
+     direct_register_custom_op,
+@@ -465,6 +467,26 @@
+         )
+         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
+ 
++        # local-59 (#64425): run the tiny unquantized in_proj_ba GEMM on the
++        # aux stream so it hides behind in_proj_qkvz. Only under CUDA graph
++        # capture (mode 0 runs this outside torch.compile). VLLM_GDN_BA_OVERLAP=0
++        # restores the serial path.
++        self._ba_stream = None
++        if os.environ.get("VLLM_GDN_BA_OVERLAP", "1") == "1":
++            from vllm.model_executor.layers.linear import UnquantizedLinearMethod
++            from vllm.model_executor.layers.utils import default_unquantized_gemm
++
++            ba_method = self.in_proj_ba.quant_method
++            if (
++                current_platform.is_cuda()
++                and isinstance(ba_method, UnquantizedLinearMethod)
++                and getattr(ba_method, "_gemm_impl", None) is default_unquantized_gemm
++                and not vllm_config.parallel_config.use_ubatching
++                and vllm_config.lora_config is None
++            ):
++                self._ba_stream = aux_stream()
++                self._ba_events = (torch.cuda.Event(), torch.cuda.Event())
++
+         query_key_settings = (self.key_dim, 0, False)
+         value_settings = (self.value_dim, 0, False)
+ 
+@@ -967,8 +989,20 @@
+         # ============================================================
+         # Part 1: Input Projection
+         # ============================================================
+-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+-        ba, _ = self.in_proj_ba(hidden_states)
++        if self._ba_stream is None:
++            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
++            ba, _ = self.in_proj_ba(hidden_states)
++        else:
++            # Aux-first order, as upstream (#64425).
++            start, done = self._ba_events
++            mixed_qkvz, (ba,) = execute_in_parallel(
++                lambda: self.in_proj_qkvz(hidden_states)[0],
++                [lambda: self.in_proj_ba(hidden_states)[0]],
++                start,
++                [done],
++                [self._ba_stream],
++                enable=num_tokens <= 256 and torch.cuda.is_current_stream_capturing(),
++            )
+ 
+         use_fused_gdn_decode = (
+             self.enable_fused_gdn_decode
+diff -ru a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -326,7 +326,7 @@
+                         _QSA_COW_UNMAPPED_WARNED = True
+                         from vllm.logger import init_logger
+ 
+-                        init_logger(__name__).warning(
++                        init_logger(__name__).debug(
+                             "QSA host KV copy-on-write: block %d has no KV cache "
+                             "group in this step's block ids; copying it anyway.",
+                             dst,
+diff -ru a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
+--- a/vllm/v1/worker/gpu/pp_utils.py
++++ b/vllm/v1/worker/gpu/pp_utils.py
+@@ -217,11 +217,13 @@
+             draft_tokens = slot.draft_tokens
+             draft_idx_mapping = slot.idx_mapping
+             if exclude_mask.any():
+-                keep = ~exclude_mask
+-                keep_t = torch.as_tensor(keep, device=self.device)
+-                draft_tokens = draft_tokens[keep_t]
++                # local-59 (#64458): index rows instead of a boolean mask, which
++                # cost a blocking H2D copy plus a nonzero() D2H sync per step.
++                keep_idx = np.flatnonzero(~exclude_mask)
++                keep_t = async_tensor_h2d(keep_idx, device=self.device)
++                draft_tokens = draft_tokens.index_select(0, keep_t)
+                 draft_idx_mapping = async_tensor_h2d(
+-                    slot.idx_mapping_np[keep], device=self.device
++                    slot.idx_mapping_np[keep_idx], device=self.device
+                 )
+             draft_tokens_to_update[draft_idx_mapping] = draft_tokens
+ 

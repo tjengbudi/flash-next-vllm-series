@@ -1,0 +1,243 @@
+diff -ruN a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py c/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py	2026-10-28 12:10:20.051672792 +0700
++++ c/vllm/models/qwen4_exp/nvidia/ngram_embedding.py	2026-10-28 14:32:19.485279451 +0700
+@@ -577,6 +577,36 @@
+ _PLE_MMAP_PATH_ENV = "VLLM_PLE_MMAP_PATH"
+ _PLE_MMAP_REBUILD_ENV = "VLLM_PLE_MMAP_REBUILD"
+ _PLE_HOST_GATHER_ENV = "VLLM_PLE_HOST_GATHER"
++# local-49: an INT8 copy of the table (QEngine's ngram_int8.safetensors: per row
++# embedding_dim int8 values then one fp16 scale, x = q * scale; shards contiguous
++# in index order) mapped in place of the BF16 file. Half the bytes per gathered
++# row and half the page cache (51.8 vs 102.4 GB); rows are dequantized on the GPU.
++_PLE_INT8_PATH_ENV = "VLLM_PLE_INT8_PATH"
++# local-49b: VLLM_PLE_INT8_LOCK=1 mlocks the mapped INT8 table (in a background
++# thread at load), so decode never waits on a page fault; the page cache alone
++# kept only ~64% of it resident on the rig and decode read the disk.
++_PLE_INT8_LOCK_ENV = "VLLM_PLE_INT8_LOCK"
++
++
++@triton.jit
++def _ple_int8_dequant_kernel(
++    src_ptr,
++    out_ptr,
++    ROW_BYTES: tl.constexpr,
++    DIM: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    """One staged INT8 row (DIM int8, then an fp16 scale) -> DIM output values."""
++    row = tl.program_id(0).to(tl.int64)
++    base = src_ptr + row * ROW_BYTES
++    offs = tl.arange(0, BLOCK)
++    mask = offs < DIM
++    q = tl.load(base + offs, mask=mask, other=0)
++    lo = tl.load(base + DIM).to(tl.uint16)
++    hi = tl.load(base + DIM + 1).to(tl.uint16)
++    scale = ((hi << 8) | lo).to(tl.float16, bitcast=True).to(tl.float32)
++    values = q.to(tl.int8, bitcast=True).to(tl.float32) * scale
++    tl.store(out_ptr + row * DIM + offs, values.to(out_ptr.dtype.element_ty), mask=mask)
+ 
+ # numpy has no bfloat16, so rows are gathered through a same-width int view.
+ _PLE_STORAGE_NUMPY_DTYPES = {1: np.int8, 2: np.int16, 4: np.int32}
+@@ -998,6 +1028,7 @@
+             )
+         self._mmap_array: "np.memmap | None" = None
+         self._mmap_prefilled = False
++        self._int8_path = os.environ.get(_PLE_INT8_PATH_ENV, "").strip()
+         # Rows copied into the table so far. The PLE hash buffers and the
+         # n-gram shards arrive in separate load_weights calls (they live in
+         # different checkpoint files), so finalize must wait for every row.
+@@ -1056,15 +1087,32 @@
+             dtype=self.weight.dtype,
+             device=device,
+         )
+-        self._host_stage = torch.empty(
+-            max_total_tokens * self.etp_data_parallel_size * num_ngram_heads,
+-            self.embedding_dim,
+-            dtype=self.weight.dtype,
+-            device="cpu",
+-            pin_memory=True,
+-        )
+-        storage_dtype = _PLE_STORAGE_TORCH_DTYPES[self.weight.dtype.itemsize]
+-        self._host_stage_np = self._host_stage.view(storage_dtype).numpy()
++        stage_rows = max_total_tokens * self.etp_data_parallel_size * num_ngram_heads
++        if self._int8_path:
++            # local-49: int8 rows plus their fp16 scale, copied as bytes and
++            # dequantized on the device into the lookup buffer.
++            self._row_bytes = self.embedding_dim + 2
++            self._host_stage = torch.empty(
++                stage_rows, self._row_bytes, dtype=torch.uint8,
++                device="cpu", pin_memory=True,
++            )
++            self._host_stage_np = self._host_stage.numpy()
++            # local-49b: the dequant kernel reads the pinned stage over UVA, so
++            # a step costs one launch and no separate host-to-device copy.
++            self._host_stage_uva = get_accelerator_view_from_cpu_tensor(
++                self._host_stage
++            )
++        else:
++            self._row_bytes = self.embedding_dim * self.weight.dtype.itemsize
++            self._host_stage = torch.empty(
++                stage_rows,
++                self.embedding_dim,
++                dtype=self.weight.dtype,
++                device="cpu",
++                pin_memory=True,
++            )
++            storage_dtype = _PLE_STORAGE_TORCH_DTYPES[self.weight.dtype.itemsize]
++            self._host_stage_np = self._host_stage.view(storage_dtype).numpy()
+         self._output_dim = num_ngram_heads * self.embedding_dim
+ 
+         # Created after allocate_embedding_weight() has mapped the file, since
+@@ -1078,7 +1126,7 @@
+             self._page_prefetcher = _PLEPagePrefetcher(
+                 base_address=self._mmap_array.ctypes.data,
+                 nbytes=self._mmap_array.nbytes,
+-                row_bytes=self.embedding_dim * self.weight.dtype.itemsize,
++                row_bytes=self._row_bytes,
+                 batch_rows=batch_tokens * num_ngram_heads,
+             )
+             logger.info(
+@@ -1104,6 +1152,8 @@
+         dtype: torch.dtype,
+     ) -> torch.Tensor:
+         """Map the complete PLE weight from the raw file on disk."""
++        if self._int8_path:
++            return self._map_int8_table(num_embeddings, embedding_dim, dtype)
+         np_dtype = _PLE_STORAGE_NUMPY_DTYPES.get(dtype.itemsize)
+         if np_dtype is None:
+             raise RuntimeError(
+@@ -1153,6 +1203,110 @@
+         )
+         return torch.from_numpy(self._mmap_array).view(dtype)
+ 
++    def _map_int8_table(
++        self, num_embeddings: int, embedding_dim: int, dtype: torch.dtype
++    ) -> torch.Tensor:
++        """local-49: map the INT8 table; return a zero-size stand-in weight."""
++        import json
++        import struct
++
++        path = self._int8_path
++        with open(path, "rb") as handle:
++            header_len = struct.unpack("<Q", handle.read(8))[0]
++            header = json.loads(handle.read(header_len))
++        shards = sorted(
++            (
++                (int(name.rsplit("_", 1)[1]), info)
++                for name, info in header.items()
++                if ".ngram_q8.shard_" in name
++            ),
++        )
++        row_bytes = embedding_dim + 2
++        if not shards:
++            raise RuntimeError(f"{path} holds no ngram_q8.shard_* tensors")
++        for (index, info), (_, nxt) in zip(shards, shards[1:]):
++            if info["data_offsets"][1] != nxt["data_offsets"][0]:
++                raise RuntimeError(f"{path}: shard {index} is not followed by shard {index + 1}")
++        for index, info in shards:
++            if info["dtype"] != "U8" or info["shape"][1] != row_bytes:
++                raise RuntimeError(
++                    f"{path}: shard {index} is {info['dtype']} {info['shape']}, "
++                    f"expected U8 [rows, {row_bytes}]"
++                )
++        start = shards[0][1]["data_offsets"][0]
++        rows = (shards[-1][1]["data_offsets"][1] - start) // row_bytes
++        if rows != num_embeddings:
++            raise RuntimeError(
++                f"{path} has {rows} rows but this model needs {num_embeddings}"
++            )
++        self._mmap_array = np.memmap(
++            path, dtype=np.uint8, mode="r", offset=8 + header_len + start,
++            shape=(rows, row_bytes),
++        )
++        self._mmap_prefilled = True
++        raw_map = getattr(self._mmap_array, "_mmap", None)
++        if raw_map is not None and hasattr(raw_map, "madvise"):
++            try:
++                raw_map.madvise(mmap.MADV_RANDOM)
++            except OSError as err:
++                logger.warning("MADV_RANDOM on the PLE table failed: %s", err)
++        logger.info(
++            "PLE table mapped from %s as INT8 rows (%.2f GiB, local-49)",
++            path, rows * row_bytes / (1 << 30),
++        )
++        if os.environ.get(_PLE_INT8_LOCK_ENV, "0").strip() not in ("", "0"):
++            self._start_int8_lock()
++        # The checkpoint copy is skipped (prefilled), so the weight only has to
++        # carry the shape and dtype; it owns one element.
++        return torch.zeros(1, dtype=dtype).as_strided(
++            (num_embeddings, embedding_dim), (0, 0)
++        )
++
++    def _start_int8_lock(self) -> None:
++        """local-49b: mlock the whole mapped table in a background thread."""
++        import time
++
++        array = self._mmap_array
++        addr, nbytes = array.ctypes.data, array.nbytes
++
++        path = self._int8_path
++        offset = int(array.offset)
++
++        def lock() -> None:
++            libc = ctypes.CDLL("libc.so.6", use_errno=True)
++            start = time.monotonic()
++            # The mapping is MADV_RANDOM (no readahead), so mlock alone faults
++            # the cold table in 4 KiB at a time (~1000 s on the rig). Read the
++            # file sequentially first (~2 min), then lock the cached pages.
++            try:
++                fd = os.open(path, os.O_RDONLY)
++                try:
++                    os.posix_fadvise(fd, offset, nbytes, os.POSIX_FADV_SEQUENTIAL)
++                    pos, end, chunk = offset, offset + nbytes, 64 << 20
++                    while pos < end:
++                        got = os.pread(fd, min(chunk, end - pos), pos)
++                        if not got:
++                            break
++                        pos += len(got)
++                finally:
++                    os.close(fd)
++            except OSError as err:
++                logger.warning("PLE INT8 table pre-read failed: %s", err)
++            rc = libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes))
++            err = ctypes.get_errno()
++            if rc == 0:
++                logger.info(
++                    "PLE INT8 table locked in RAM (%.2f GiB, %.0f s)",
++                    nbytes / (1 << 30), time.monotonic() - start,
++                )
++            else:
++                logger.warning(
++                    "mlock of the PLE INT8 table failed (%s); it stays in the "
++                    "page cache only", os.strerror(err),
++                )
++
++        threading.Thread(target=lock, name="ple-int8-mlock", daemon=True).start()
++
+     def weight_loader(
+         self,
+         param: torch.Tensor,
+@@ -1226,9 +1380,20 @@
+             np.take(self._mmap_array, local_ids, axis=0, out=stage)
+             if not in_range.all():
+                 stage[~in_range] = 0
+-            output.view(-1, self.embedding_dim).copy_(
+-                self._host_stage[:count], non_blocking=True
+-            )
++            if self._int8_path:
++                # The ids copy above synchronized the device, so the previous
++                # step's kernel has read the stage before np.take refilled it.
++                _ple_int8_dequant_kernel[(count,)](
++                    self._host_stage_uva,
++                    output.view(-1, self.embedding_dim),
++                    ROW_BYTES=self._row_bytes,
++                    DIM=self.embedding_dim,
++                    BLOCK=self._block_d,
++                )
++            else:
++                output.view(-1, self.embedding_dim).copy_(
++                    self._host_stage[:count], non_blocking=True
++                )
+         return output
+ 
+     prefetch_from_model_state: bool      # set in __init__ from VLLM_PLE_HOST_GATHER

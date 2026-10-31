@@ -1,0 +1,147 @@
+diff -ruN a/vllm/config/scheduler.py c/vllm/config/scheduler.py
+--- a/vllm/config/scheduler.py	2026-10-28 04:07:15.343903481 +0700
++++ c/vllm/config/scheduler.py	2026-10-28 04:52:37.338265153 +0700
+@@ -202,9 +202,12 @@
+     (the default) disables the watermark."""
+ 
+     prefill_schedule_interval: int = Field(default=1, ge=1)
+-    """For data-parallel deployments, only admit new prefill requests
+-    once every N engine steps, aligned across DP ranks, to better balance
+-    per-step forward-pass times."""
++    """Only admit prefill once every N engine steps, leaving the steps in
++    between to decode alone. 1 (the default) admits prefill on every step.
++
++    A deferred step carries no prefill at all, including chunks of an
++    already-admitted prompt, so a long prompt can take up to N times as many
++    steps to finish prefilling."""
+ 
+     async_scheduling: bool | None = None
+     """If set to False, disable async scheduling. Async scheduling helps to
+Binary files a/vllm/v1/core/sched/__pycache__/scheduler.cpython-312.pyc and c/vllm/v1/core/sched/__pycache__/scheduler.cpython-312.pyc differ
+diff -ruN a/vllm/v1/core/sched/scheduler.py c/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py	2026-10-28 04:07:14.642904101 +0700
++++ c/vllm/v1/core/sched/scheduler.py	2026-10-28 04:52:37.366265128 +0700
+@@ -354,6 +354,44 @@
+         # prefill batch fully drained the waiting queue. Prefill throttling
+         # is disabled in this case.
+         self.prefill_capacity_bound = False
++        # local-48 (#54627): the DP engine core drives this cadence from a
++        # counter shared across ranks; an engine without one never throttles,
++        # so apply the interval locally, timed from the last prefill-carrying
++        # step. MoE DP ranks (size > 1) keep the engine-driven cadence.
++        self.local_prefill_interval = (
++            self.scheduler_config.prefill_schedule_interval
++            if self.parallel_config.data_parallel_size == 1
++            else 1
++        )
++        if self.local_prefill_interval > 1:
++            logger.info_once(
++                "Prefill cadence: applying prefill_schedule_interval=%d "
++                "locally (this engine is not DP-coordinated); prefill is held "
++                "until %d executed steps have passed since the last "
++                "prefill-carrying step.",
++                self.local_prefill_interval,
++                self.local_prefill_interval,
++            )
++        # A full interval back, so the first step is never gated.
++        self.last_prefill_step = -self.local_prefill_interval
++        # Steps that actually scheduled tokens. `current_step` counts every
++        # schedule() call including empty ones, so it would expire the hold
++        # early.
++        self.num_executed_steps = 0
++        # local-48b: with PP a lone prefill chunk crosses the stages one after
++        # another, so a held cadence also loses the prefill pipelining (Swift
++        # Flash-Next PP=3, interval 4: 200K cold prefill 81 -> 210 s). Let
++        # prefill through for VLLM_PREFILL_CADENCE_BURST consecutive executed
++        # steps (e.g. pp_size) once the interval has elapsed. 1 = #54627.
++        self.prefill_burst = max(
++            1, int(os.environ.get("VLLM_PREFILL_CADENCE_BURST", "1") or "1")
++        )
++        self.prefill_burst_left = 0
++        if self.local_prefill_interval > 1 and self.prefill_burst > 1:
++            logger.info_once(
++                "Prefill cadence burst: %d consecutive prefill steps per interval",
++                self.prefill_burst,
++            )
+         self.scheduler_reserve_full_isl = (
+             self.scheduler_config.scheduler_reserve_full_isl
+         )
+@@ -606,6 +644,9 @@
+         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+         # Whether the running batch contains any prefill requests.
+         prefill_scheduled = False
++        # Whether a waiting request was admitted with prompt left to compute.
++        # Separate from `prefill_scheduled`, which covers only the running loop.
++        prefill_admitted = False
+         # Whether any scheduled request has a synchronous connector KV load.
+         has_sync_kv_loads = False
+ 
+@@ -637,6 +678,24 @@
+                 long_prefill_token_threshold, input_budget // num_eligible_reqs
+             )
+ 
++        # local-48 (#54627) local prefill cadence: hold prefill until the
++        # interval since the last prefill-carrying step has elapsed, so decode
++        # runs in longer uninterrupted stretches. Mirrors the DP gate above,
++        # including its capacity escape (#44558).
++        if (
++            not defer_prefills
++            and self.local_prefill_interval > 1
++            and not self.prefill_capacity_bound
++            and self.prefill_burst_left == 0
++            # This call becomes executed step num_executed_steps + 1 if it
++            # schedules anything, and last_prefill_step is stamped on the same
++            # convention below.
++            and (self.num_executed_steps + 1) - self.last_prefill_step
++            < self.local_prefill_interval
++            and any(not r.is_prefill_chunk for r in self.running)
++        ):
++            defer_prefills = True
++
+         # local-12: with PP microbatching every decode waits pp_size steps after
+         # its last step, so decodes scheduled in the same step stay in the same
+         # microbatch for good and the other stages idle (2 requests that start
+@@ -1293,6 +1352,9 @@
+                     )
+ 
+                 if load_kv_async:
++                    # local-48: this path does not reach `prefill_admitted`, so
++                    # it does not restart the prefill cadence (no prefill
++                    # compute is scheduled for this request this step).
+                     # If loading async, allocate memory and put request
+                     # into the WAITING_FOR_REMOTE_KV state.
+                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+@@ -1356,6 +1418,10 @@
+                     scheduled_spec_decode_tokens[request_id] = [
+                         -1
+                     ] * self.num_spec_tokens
++                # local-48: same predicate as the deferral gate in this loop
++                # (`num_computed_tokens < num_tokens - 1`), so full prefix-cache
++                # hits and remote-KV resumes do not restart the interval.
++                prefill_admitted |= num_computed_tokens < request.num_tokens - 1
+                 # Only track requests that will still be prefilling after this chunk.
+                 if num_computed_tokens + num_new_tokens < request.num_tokens:
+                     self._inflight_prefills.add(request)
+@@ -1390,6 +1456,22 @@
+         # Check if the scheduling constraints are satisfied.
+         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
++        # local-48: count this step before stamping the cadence below, so that
++        # last_prefill_step includes the step that carried the prefill.
++        if total_num_scheduled_tokens > 0:
++            self.num_executed_steps += 1
++        # Restart the cadence interval from any step that carried prefill,
++        # whether a new admission or a running chunk.
++        if self.local_prefill_interval > 1 and total_num_scheduled_tokens > 0:
++            if prefill_scheduled or prefill_admitted:
++                if self.prefill_burst_left > 0:
++                    self.prefill_burst_left -= 1
++                else:
++                    self.last_prefill_step = self.num_executed_steps
++                    self.prefill_burst_left = self.prefill_burst - 1
++            else:
++                # Nothing left to prefill inside the burst: end it.
++                self.prefill_burst_left = 0
+ 
+         assert token_budget >= 0
+         assert input_budget >= 0

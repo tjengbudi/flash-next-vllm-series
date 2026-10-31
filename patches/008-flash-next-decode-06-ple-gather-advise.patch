@@ -1,0 +1,83 @@
+If you would like to merge this patch upstream, I would appreciate it if you could keep me credited as the commit author, or add the following trailer to the commit message: 
+
+Co-authored-by: Minachist <84688797+aiueonicked@users.noreply.github.com>
+
+Qwen3.8-Flash-Next decode patch 06: advise PLE pages before the decode gather.
+
+vllm/models/qwen4_exp/nvidia/ngram_embedding.py (needs
+flash-next-ttft-01-ple-page-prefetch.patch)
+
+The rows for a token that was just sampled cannot be prefetched, so on a page
+cache miss np.take faulted its ~16 table pages in one at a time, 2-4 ms of
+NVMe latency on the critical path per affected step. The gather now asks for
+all of those pages in one process_madvise(MADV_WILLNEED) call first, so the
+reads overlap. Off together with the prefetch thread (VLLM_PLE_PREFETCH=0).
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+index e065074..451a085 100644
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+@@ -604,6 +604,8 @@ _PLE_STORAGE_TORCH_DTYPES = {1: torch.int8, 2: torch.int16, 4: torch.int32}
+ # VLLM_PLE_PREFETCH=0 disables the prefetch.
+ 
+ _PLE_PREFETCH_ENV = "VLLM_PLE_PREFETCH"
++# Gathers up to this many rows (decode batches) advise their pages first.
++_PLE_GATHER_ADVISE_MAX_ROWS = 256
+ _PLE_PREFETCH_BATCH_ENV = "VLLM_PLE_PREFETCH_BATCH"  # tokens per advise batch
+ 
+ 
+@@ -676,6 +678,7 @@ class _PLEPagePrefetcher:
+         self._libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+         self._libc.madvise.restype = ctypes.c_int
+         self._pidfd = -1
++        self._iov_now: "np.ndarray | None" = None
+         self._batched = self._probe_process_madvise()
+         self._lock = threading.Lock()
+         self._inflight: dict[str, int] = {}     # req_id -> job token
+@@ -723,6 +726,33 @@ class _PLEPagePrefetcher:
+                     if self._inflight.get(req_id) == token:
+                         del self._inflight[req_id]
+ 
++    def advise_now(self, rows: np.ndarray) -> None:
++        """Advise the pages of a few ``rows`` from the calling thread.
++
++        The decode-path variant of ``_advise``: one process_madvise call over
++        the first and last page of every row, duplicates included (the kernel
++        skips resident pages quickly), with a preallocated iovec array.
++        """
++        n = rows.size
++        if not self._batched or 2 * n > self._IOV_MAX:
++            self._advise(np.asarray(rows, dtype=np.int64))
++            return
++        iov = self._iov_now
++        if iov is None:
++            iov = self._iov_now = np.empty((self._IOV_MAX, 2), dtype=np.uint64)
++            iov[:, 1] = 1 << self._PAGE_SHIFT
++        offs = rows.astype(np.uint64, copy=False) * np.uint64(self._row_bytes)
++        mask = np.uint64(~((1 << self._PAGE_SHIFT) - 1) & 0xFFFFFFFFFFFFFFFF)
++        base = np.uint64(self._base)
++        iov[:n, 0] = (offs & mask) + base
++        iov[n : 2 * n, 0] = ((offs + np.uint64(self._row_bytes - 1)) & mask) + base
++        rc = self._libc.syscall(
++            self._SYS_PROCESS_MADVISE, self._pidfd,
++            ctypes.c_void_p(iov.ctypes.data), 2 * n, self._MADV_WILLNEED, 0,
++        )
++        if rc < 0:
++            self._batched = False
++
+     def _advise(self, rows: np.ndarray) -> None:
+         shift = self._PAGE_SHIFT
+         offsets = rows * self._row_bytes
+@@ -1053,6 +1083,12 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+             in_range = (ids >= vocab_start) & (ids < vocab_end)
+             local_ids = np.where(in_range, ids - vocab_start, 0)
+             stage = self._host_stage_np[:count]
++            prefetcher = self._page_prefetcher
++            if prefetcher is not None and count <= _PLE_GATHER_ADVISE_MAX_ROWS:
++                # Decode: the rows of the token just sampled could not be
++                # prefetched. Ask for all their pages at once so the faults
++                # below overlap instead of reading one page at a time.
++                prefetcher.advise_now(local_ids)
+             np.take(self._mmap_array, local_ids, axis=0, out=stage)
+             if not in_range.all():
+                 stage[~in_range] = 0

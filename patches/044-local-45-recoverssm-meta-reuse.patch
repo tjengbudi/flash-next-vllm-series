@@ -1,0 +1,106 @@
+--- a/vllm/v1/attention/backends/gdn_recoverssm.py	2026-10-27 10:49:56.676230105 +0700
++++ b/vllm/v1/attention/backends/gdn_recoverssm.py	2026-10-27 11:20:48.499725089 +0700
+@@ -12,7 +12,8 @@
+ (``QwenGatedDeltaNetAttention.recoverssm_replay``) at the request's persistent slot
+ (``req_idx``), and the commit reads it from there."""
+ 
+-from dataclasses import dataclass, field, fields
++import os
++from dataclasses import dataclass, field, fields, replace
+ from typing import Any
+ 
+ import torch
+@@ -34,6 +35,15 @@
+ 
+ logger = init_logger(__name__)
+ 
++# local-45: share one GDN group's metadata with the other GDN groups of the step
++# (update_block_table), as the base builder does. 0 = full build per group (l44).
++_META_REUSE = os.environ.get("VLLM_RECOVERSSM_META_REUSE", "1") != "0"
++# Default 0: gather the state indices per group (mamba_get_block_table_tensor, as l44
++# did). 1 = the runner's one-launch aligned precompute, which on the rig changed a
++# sequential greedy output (seq4) that 5 earlier boots kept identical: not equivalent
++# for RecoverSSM, not root-caused. Speed is the same either way.
++_ALIGNED_IDX = os.environ.get("VLLM_RECOVERSSM_ALIGNED_IDX", "0") == "1"
++
+ 
+ @dataclass
+ class GDNRecoverSSMCommitMetadata:
+@@ -55,6 +65,8 @@
+     # replay-buffer row per spec window (its request slot), padded like the state
+     # indices
+     recoverssm_record_indices: torch.Tensor | None = None
++    # local-45: the batch's seq_lens, for VLLM_RECOVERSSM_ALIGNED_IDX=0 reuse
++    recoverssm_seq_lens: torch.Tensor | None = field(default=None, repr=False)
+ 
+     def commit_recoverssm_state(
+         self, num_accepted_tokens: torch.Tensor
+@@ -103,6 +115,19 @@
+         self._context: Any = None
+         self._logged = False
+         self._capturing = False
++        # local-45: the base gate is `type(self) is GDNAttentionMetadataBuilder`, so this
++        # subclass rebuilt the whole metadata for every GDN group on every step (prefill
++        # rig: build 15-18% of a rank's main thread vs 2% without RecoverSSM). Only the
++        # commit plan is per group; update_block_table rebuilds that part.
++        if (
++            _META_REUSE
++            and vllm_config.use_v2_model_runner
++            and device.type == "cuda"
++            and not self.supports_update_block_table
++        ):
++            self.supports_update_block_table = True
++            if _ALIGNED_IDX:
++                self.mamba_aligned_state_indices: torch.Tensor | None = None
+ 
+     def _get_context(self):
+         if self._context is None:
+@@ -198,7 +223,48 @@
+             recoverssm_record_indices=(
+                 commit.record_indices if commit is not None else None
+             ),
++            recoverssm_seq_lens=m.seq_lens,
++        )
++
++    def update_block_table(  # type: ignore[override]
++        self,
++        metadata: "GDNRecoverSSMMetadata",
++        blk_table: torch.Tensor,
++        slot_mapping: torch.Tensor,
++    ) -> "GDNRecoverSSMMetadata":
++        """local-45: this group's state indices on top of another GDN group's
++        metadata. Batch-level fields (query offsets, spec rows, record rows, accepted
++        counts) stay shared; the commit plan takes this group's state indices, block
++        table and layers."""
++        if (
++            not _ALIGNED_IDX
++            and self.vllm_config.cache_config.mamba_cache_mode == "align"
++        ):
++            from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
++
++            assert metadata.recoverssm_seq_lens is not None
++            self.mamba_aligned_state_indices = mamba_get_block_table_tensor(
++                blk_table, metadata.recoverssm_seq_lens, self.kv_cache_spec, "align"
++            )
++            try:
++                meta = super().update_block_table(metadata, blk_table, slot_mapping)
++            finally:
++                del self.mamba_aligned_state_indices
++        else:
++            meta = super().update_block_table(metadata, blk_table, slot_mapping)
++        commit = metadata.recoverssm_commit
++        if meta.spec_state_indices_tensor is not None:
++            meta = replace(
++                meta, spec_state_indices_tensor=meta.spec_state_indices_tensor[:, :1]
++            )
++        if commit is None:
++            return meta
++        commit = replace(
++            commit,
++            state_indices=meta.spec_state_indices_tensor,
++            block_table=blk_table if commit.block_table is not None else None,
+         )
++        return replace(meta, recoverssm_commit=commit, recoverssm_context=self._get_context())
+ 
+     def _stage_record_indices(
+         self,

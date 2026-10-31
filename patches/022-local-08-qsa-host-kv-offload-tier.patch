@@ -1,0 +1,754 @@
+diff -ruN a/vllm/config/vllm.py b/vllm/config/vllm.py
+--- a/vllm/config/vllm.py	2026-10-20 22:26:53.122603806 +0700
++++ b/vllm/config/vllm.py	2026-10-20 22:27:06.627593123 +0700
+@@ -1245,6 +1245,11 @@
+             return
+         if self.model_config is not None and (self.model_config.enable_cumem_allocator):
+             return
++        # local-08: the native CPU offload connector copies blocks through
++        # virtual addresses (cuMemcpyBatchAsync) and registers no GPU memory,
++        # so a VMM remap cannot leave it holding stale pages.
++        if self.kv_transfer_config.kv_connector == "OffloadingConnector":
++            return
+ 
+         raise ValueError(
+             f"KV connector {self.kv_transfer_config.kv_connector} is "
+diff -ruN a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py	2026-10-20 22:26:53.134603797 +0700
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py	2026-10-20 23:36:22.421883599 +0700
+@@ -281,4 +281,60 @@
+         replicated_layout=replicated_layout,
+         canonical_layout=canonical_layout,
+         kv_cache_layout=vllm_config.cache_config.kv_cache_layout,
++        group_host_bytes=_group_host_bytes(vllm_config, selected_groups),
+     )
++
++
++def _group_host_bytes(
++    vllm_config: "VllmConfig",
++    selected_groups: "tuple[tuple[int, KVCacheGroupSpec], ...]",
++) -> dict[int, int]:
++    """local-08: host-resident K/V bytes per block, per group, widest rank.
++
++    Qwen4Exp QSA with VLLM_QSA_KV_OFFLOAD=1 keeps the K/V of its attention
++    layers in host memory, and the worker offloads it with the block. Their
++    specs keep one head slot on the GPU (num_head_slots == 1); the indexer
++    layers sharing the group stay on the GPU. The figure counts the QSA
++    layers of the PP rank holding the most, taken from the model config, so
++    the scheduler and every worker (each of which sees only its own layers)
++    arrive at the same pool layout.
++    """
++    from vllm.distributed.utils import get_pp_indices
++    from vllm.platforms.interface import _qsa_offload_host_bytes_per_layer
++    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
++
++    per_layer = _qsa_offload_host_bytes_per_layer(vllm_config)
++    if not per_layer:
++        return {}
++
++    def has_host_layers(group: "KVCacheGroupSpec") -> bool:
++        spec = group.kv_cache_spec
++        if isinstance(spec, UniformTypeKVCacheSpecs):
++            return any(
++                getattr(s, "num_head_slots", None) == 1
++                for s in spec.kv_cache_specs.values()
++            )
++        # Scheduler configs flatten UniformTypeKVCacheSpecs to one
++        # representative layer spec, which may be an indexer layer's, so the
++        # scheduler also goes by the QSA attention layer names.
++        return getattr(spec, "num_head_slots", None) == 1 or any(
++            name.endswith(".self_attn.attn") for name in group.layer_names
++        )
++
++    text_config = vllm_config.model_config.hf_text_config
++    layer_types = getattr(text_config, "layer_types", None) or []
++    full = [i for i, kind in enumerate(layer_types) if kind == "full_attention"]
++    pp_size = vllm_config.parallel_config.pipeline_parallel_size
++    counts = []
++    for rank in range(pp_size):
++        start, end = get_pp_indices(len(layer_types), rank, pp_size)
++        counts.append(sum(start <= i < end for i in full))
++    if vllm_config.speculative_config is not None:
++        # The drafter's attention layers are built on the last rank.
++        counts[-1] += max(1, int(getattr(text_config, "mtp_num_hidden_layers", 1) or 1))
++    widest = max(counts)
++    return {
++        group_id: widest * per_layer
++        for group_id, group in selected_groups
++        if has_host_layers(group)
++    }
+diff -ruN a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py	2026-10-20 22:26:53.145603788 +0700
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py	2026-10-20 23:16:27.163128808 +0700
+@@ -66,8 +66,57 @@
+         self._connector_worker_meta = OffloadingWorkerMetadata()
+ 
+     def _init_worker(self, kv_caches: CanonicalKVCaches) -> None:
++        self._add_host_resident_kv(kv_caches)
+         self.worker = self.spec.get_worker(kv_caches)
+ 
++    def _add_host_resident_kv(self, kv_caches: CanonicalKVCaches) -> None:
++        """local-08: offload host-resident K/V with its block.
++
++        Layers that keep K/V in host memory (Qwen4Exp QSA with
++        VLLM_QSA_KV_OFFLOAD=1) hold only a slot in kv_caches. Their host view
++        becomes one more tensor of the group, so every store and load copies
++        it in the same batch as the GPU part, on the same stream. The CPU side
++        keeps it in the rows of the group's chunk pool (CPUOffloadingSpec).
++        """
++        from vllm.v1.worker.utils import KV_CACHE_HOST_RESIDENT_VIEWS
++
++        if not KV_CACHE_HOST_RESIDENT_VIEWS:
++            return
++        kv_cache_config = self.kv_cache_config
++        num_blocks = kv_cache_config.num_blocks
++        budgets = self.spec.config.group_host_bytes
++        selected_group_ids = get_offloading_group_ids(kv_cache_config)
++        assert len(selected_group_ids) == len(kv_caches.group_data_refs)
++        added_layers = 0
++        for refs, group_id in zip(kv_caches.group_data_refs, selected_group_ids):
++            group_bytes = 0
++            for layer_name in kv_cache_config.kv_cache_groups[group_id].layer_names:
++                view = KV_CACHE_HOST_RESIDENT_VIEWS.get(layer_name)
++                if view is None:
++                    continue
++                # Kernel blocks of one manager block are adjacent rows.
++                tensor = view.view(torch.int8).reshape(num_blocks, -1)
++                page = tensor.shape[1]
++                canonical = CanonicalKVCacheTensor(tensor, page)
++                canonical.host_group_id = group_id
++                kv_caches.tensors.append(canonical)
++                refs.append(CanonicalKVCacheRef(len(kv_caches.tensors) - 1, page))
++                group_bytes += page
++                added_layers += 1
++            if group_bytes > budgets.get(group_id, 0):
++                raise RuntimeError(
++                    f"KV offload: group {group_id} has {group_bytes} bytes of "
++                    "host-resident K/V per block on this rank, but its chunk "
++                    f"pool was sized for {budgets.get(group_id, 0)}."
++                )
++        if added_layers:
++            logger.info(
++                "KV offload: %d host-resident K/V layers join their blocks "
++                "(group budgets: %s)",
++                added_layers,
++                {g: f"{b / 2**20:.1f} MiB" for g, b in budgets.items()},
++            )
++
+     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+         kv_cache_config = self.kv_cache_config
+         selected_group_ids = get_offloading_group_ids(kv_cache_config)
+diff -ruN a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py	2026-10-20 22:26:53.190603752 +0700
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py	2026-10-20 22:27:28.999575439 +0700
+@@ -310,6 +310,18 @@
+             row_cache.invalidate_all()
+ 
+ 
++def _qsa_invalidate_row_caches(block_ids) -> None:
++    """KV offloading is about to load host K/V into these blocks (local-08).
++
++    The decode row cache is keyed by physical slot, so rows it holds for them
++    belong to their previous owner.
++    """
++    from .ops.qsa import _QSA_ROW_CACHES
++
++    for row_cache in _QSA_ROW_CACHES.values():
++        row_cache.invalidate_all()
++
++
+ def _qsa_staged_prefill(
+     layer,
+     query,
+@@ -835,6 +847,14 @@
+ 
+         if _qsa_copy_host_kv_blocks not in KV_CACHE_BLOCK_COPY_HOOKS:
+             KV_CACHE_BLOCK_COPY_HOOKS.append(_qsa_copy_host_kv_blocks)
++        from vllm.v1.worker.utils import (
++            KV_CACHE_BLOCK_LOAD_HOOKS,
++            KV_CACHE_HOST_RESIDENT_VIEWS,
++        )
++
++        KV_CACHE_HOST_RESIDENT_VIEWS[self.layer_name] = self.kv_cache
++        if _qsa_invalidate_row_caches not in KV_CACHE_BLOCK_LOAD_HOOKS:
++            KV_CACHE_BLOCK_LOAD_HOOKS.append(_qsa_invalidate_row_caches)
+         init_logger(__name__).info(
+             "QSA host KV %s: %d blocks x %d tokens, %.3f GiB pinned (UVA), "
+             "%.1f GiB for all %d QSA layers",
+diff -ruN a/vllm/platforms/interface.py b/vllm/platforms/interface.py
+--- a/vllm/platforms/interface.py	2026-10-20 22:26:53.179603761 +0700
++++ b/vllm/platforms/interface.py	2026-10-20 23:15:30.475192152 +0700
+@@ -114,6 +114,26 @@
+     return block_size if block_size >= 16 else None
+ 
+ 
++def _qsa_offload_host_bytes_per_layer(vllm_config: "VllmConfig") -> int:
++    """Host K/V bytes per KV block of one QSA layer under QSA offload, else 0.
++
++    KV offloading reserves this per host-resident layer in its CPU chunks
++    (local-08).
++    """
++    if os.environ.get("VLLM_QSA_KV_OFFLOAD", "0") != "1":
++        return 0
++    text_config = vllm_config.model_config.hf_text_config
++    num_kv_heads = int(getattr(text_config, "num_key_value_heads", 1) or 1)
++    head_dim = int(
++        getattr(text_config, "head_dim", 0)
++        or text_config.hidden_size // text_config.num_attention_heads
++    )
++    fp8 = str(vllm_config.cache_config.cache_dtype).startswith("fp8")
++    itemsize = 1 if fp8 else vllm_config.model_config.dtype.itemsize
++    block_size = vllm_config.cache_config.block_size
++    return num_kv_heads * block_size * 2 * head_dim * itemsize
++
++
+ class PlatformEnum(enum.Enum):
+     """Enumeration of supported hardware platforms."""
+ 
+diff -ruN a/vllm/v1/kv_offload/config.py b/vllm/v1/kv_offload/config.py
+--- a/vllm/v1/kv_offload/config.py	2026-10-20 23:15:03.217222887 +0700
++++ b/vllm/v1/kv_offload/config.py	2026-10-20 23:15:15.935208523 +0700
+@@ -3,7 +3,7 @@
+ """Normalized configuration consumed by native offloading backends."""
+ 
+ from collections.abc import Mapping
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from typing import Any
+ 
+ 
+@@ -88,3 +88,8 @@
+     canonical_layout: bool = False
+     # Resolved KVCacheLayout name of the worker KV cache.
+     kv_cache_layout: str | None = None
++    # local-08: host-resident K/V bytes per block a worker can hold for each
++    # KV cache group (group id -> bytes on the widest rank). Groups with
++    # different sizes get separate chunk pools, so a chunk reserves host space
++    # only when its group has host-resident layers.
++    group_host_bytes: Mapping[int, int] = field(default_factory=dict)
+diff -ruN a/vllm/v1/kv_offload/cpu/gpu_worker.py b/vllm/v1/kv_offload/cpu/gpu_worker.py
+--- a/vllm/v1/kv_offload/cpu/gpu_worker.py	2026-10-20 22:26:53.156603779 +0700
++++ b/vllm/v1/kv_offload/cpu/gpu_worker.py	2026-10-20 23:36:11.723894395 +0700
+@@ -198,7 +198,29 @@
+ MAX_HOST_REGISTER_CHUNK_BYTES = 64 * 1024**3
+ 
+ 
+-def pin_mmap_region(region: SharedOffloadRegion) -> None:
++def _worker_cell_spans(region: SharedOffloadRegion) -> list[tuple[int, int]] | None:
++    """local-08: (offset, size) of this worker's cell in every chunk row.
++
++    A worker of the per-worker layout only touches its own cells, and pinning
++    host memory costs GPU memory for the mapping (about 2 MiB per GiB on
++    Ampere), so pinning the whole region on every rank costs each GPU the
++    other ranks' share too. None when the cells are not page aligned.
++    """
++    if region.rank is None:
++        return None
++    offset = region._worker_offset
++    size = region._worker_area_end - offset
++    page = region.page_size
++    if size <= 0 or offset % page or size % page or region._row_stride % page:
++        return None
++    return [
++        (row * region._row_stride + offset, size) for row in range(region.num_chunks)
++    ]
++
++
++def pin_mmap_region(
++    region: SharedOffloadRegion, worker_cells_only: bool = False
++) -> None:
+     """Register row-aligned chunks, rolling back on failure."""
+     if not current_platform.is_cuda_alike():
+         logger.info(
+@@ -227,13 +249,18 @@
+     # registrations.
+     rows_per_chunk = max(MAX_HOST_REGISTER_CHUNK_BYTES // region._row_stride, 1)
+     chunk_size = rows_per_chunk * region._row_stride
++    spans = _worker_cell_spans(region) if worker_cells_only else None
++    if spans is None:
++        spans = [
++            (offset, min(chunk_size, total_size - offset))
++            for offset in range(0, total_size, chunk_size)
++        ]
+ 
+     # Register, drain and roll back through the same runtime handle, so a
+     # failed chunk leaves neither a pending error nor a partly pinned region.
+     addresses: list[int] = []
+-    for offset in range(0, total_size, chunk_size):
++    for offset, size in spans:
+         address = base_ptr + offset
+-        size = min(chunk_size, total_size - offset)
+         result = cudart.cudaHostRegister(address, size)
+         if result == 0:
+             addresses.append(address)
+@@ -816,7 +843,7 @@
+         pin_memory = PIN_MEMORY
+         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
+         if mmap_region is not None and pin_memory:
+-            pin_mmap_region(mmap_region)
++            pin_mmap_region(mmap_region, worker_cells_only=not canonical_layout)
+         host_memory_is_pinned = pin_memory and (
+             mmap_region is None or mmap_region.is_pinned
+         )
+@@ -829,6 +856,8 @@
+ 
+         gpu_tensors: list[torch.Tensor] = []
+         cpu_tensors: list[torch.Tensor] = []
++        self._host_pool_buffers: list[tuple[object, int]] = []
++        self._num_cpu_chunks = num_cpu_chunks
+         for t_idx, kv_cache_tensor in enumerate(kv_caches.tensors):
+             gpu_page_size_bytes = kv_cache_tensor.page_size_bytes
+             gpu_tensor = kv_cache_tensor.tensor.view(torch.int8).view(
+@@ -836,7 +865,16 @@
+             )
+             cpu_page_size_bytes = gpu_page_size_bytes * blocks_per_chunk
+ 
+-            if canonical_bytes_per_block is not None:
++            host_pool_rows = getattr(kv_cache_tensor, "host_pool_rows", None)
++            if host_pool_rows is not None:
++                # local-08: host-resident K/V lives outside the shared region,
++                # in rows only its own pool uses. The mapping spans every row
++                # id so chunk ids index it directly; only the pool's rows are
++                # pinned, which is also what commits them to RAM.
++                cpu_tensor = self._alloc_host_pool_rows(
++                    host_pool_rows, cpu_page_size_bytes
++                )
++            elif canonical_bytes_per_block is not None:
+                 assert mmap_region is not None
+                 cpu_tensor = mmap_region.create_next_canonical_view(
+                     canonical_bytes_per_block[t_idx] * blocks_per_chunk
+@@ -882,16 +920,60 @@
+             host_memory_is_pinned=host_memory_is_pinned,
+         )
+ 
++    def _check_chunk_ids(self, spec: LoadStoreSpec) -> None:
++        # local-08: a chunk id past this worker's rows means the scheduler
++        # and the worker disagree on the pool layout; fail clearly instead of
++        # handing the copy engine an address outside the buffers.
++        assert isinstance(spec, BlockIDsLoadStoreSpec)
++        ids = spec.block_ids
++        if len(ids) and int(ids.max()) >= self._num_cpu_chunks:
++            raise RuntimeError(
++                f"KV offload: chunk id {int(ids.max())} is past this worker's "
++                f"{self._num_cpu_chunks} chunks; the scheduler's pool layout "
++                "does not match the worker's (see 'KV offload pools' lines)."
++            )
++
++    def _alloc_host_pool_rows(
++        self, rows: tuple[int, int], row_bytes: int
++    ) -> torch.Tensor:
++        import mmap
++
++        first, count = rows
++        flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
++        flags |= getattr(mmap, "MAP_NORESERVE", 0)
++        buf = mmap.mmap(-1, (first + count) * row_bytes, flags=flags)
++        tensor = torch.frombuffer(buf, dtype=torch.int8).view(first + count, row_bytes)
++        address = tensor.data_ptr() + first * row_bytes
++        result = torch.cuda.cudart().cudaHostRegister(address, count * row_bytes, 0)
++        if result.value != 0:
++            raise RuntimeError(
++                f"KV offload: pinning {count * row_bytes / 2**30:.2f} GiB of "
++                f"host-resident K/V rows failed ({result}). The container "
++                "needs an unlimited memlock ulimit and enough free RAM."
++            )
++        self._host_pool_buffers.append((buf, address))
++        return tensor
++
+     def submit_store(
+         self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
+     ) -> bool:
+         """Async GPU -> CPU."""
++        self._check_chunk_ids(dst_spec)
+         return self._store_handler.transfer_async(job_id, src_spec, dst_spec)
+ 
+     def submit_load(
+         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
+     ) -> bool:
+         """Async CPU -> GPU."""
++        self._check_chunk_ids(src_spec)
++        # local-08: let layers with host-resident K/V drop caches keyed by
++        # the destination blocks.
++        from vllm.v1.worker.utils import KV_CACHE_BLOCK_LOAD_HOOKS
++
++        if KV_CACHE_BLOCK_LOAD_HOOKS:
++            assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
++            for hook in KV_CACHE_BLOCK_LOAD_HOOKS:
++                hook(dst_spec.block_ids)
+         return self._load_handler.transfer_async(job_id, src_spec, dst_spec)
+ 
+     def get_finished(self) -> list[TransferResult]:
+@@ -915,6 +997,12 @@
+             logger.exception("Failed to shut down load offloading handler")
+             handler_failed = True
+ 
++        for _buf, address in self._host_pool_buffers:
++            result = torch.cuda.cudart().cudaHostUnregister(address)
++            if result.value != 0:
++                logger.warning("cudaHostUnregister of host K/V rows failed (%s)", result)
++        self._host_pool_buffers.clear()
++
+         if self._mmap_region is not None:
+             if handler_failed:
+                 try:
+diff -ruN a/vllm/v1/kv_offload/cpu/manager.py b/vllm/v1/kv_offload/cpu/manager.py
+--- a/vllm/v1/kv_offload/cpu/manager.py	2026-10-20 23:15:03.240222861 +0700
++++ b/vllm/v1/kv_offload/cpu/manager.py	2026-10-20 23:54:27.927725777 +0700
+@@ -474,3 +474,207 @@
+             self.stores_skipped_in_current_batch = 0
+ 
+         return stats
++
++
++class _PoolStates:
++    """Per-pool request state of a PooledCPUOffloadingManager."""
++
++    def __init__(self) -> None:
++        self.by_pool: dict[int, dict[type, object]] = {}
++
++
++class _PoolReqContext:
++    """A ReqContext whose typed state is private to one pool.
++
++    CPUOffloadingManager keeps its per-request state in the context, keyed by
++    type, so pools sharing one context would overwrite each other's state.
++    """
++
++    def __init__(self, ctx: ReqContext, pool: int) -> None:
++        self._ctx = ctx
++        self._pool = pool
++
++    def _states(self) -> dict[type, object]:
++        holder = self._ctx.get_state(_PoolStates)
++        if holder is None:
++            holder = _PoolStates()
++            self._ctx.set_state(holder)
++        return holder.by_pool.setdefault(self._pool, {})
++
++    def get_state(self, cls):
++        return self._states().get(cls)
++
++    def set_state(self, val) -> None:
++        self._states()[type(val)] = val
++
++    def __getattr__(self, name):
++        return getattr(self._ctx, name)
++
++
++class PooledCPUOffloadingManager(OffloadingManager):
++    """local-08: CPU offloading over several chunk pools, routed by group.
++
++    Pool p owns chunk ids [offsets[p], offsets[p] + its size). Groups whose
++    chunks carry host-resident K/V use a pool whose rows have room for it;
++    the other groups use a pool whose rows hold only the GPU part. Each pool
++    is a CPUOffloadingManager with its own eviction.
++    """
++
++    def __init__(
++        self,
++        pools: list[CPUOffloadingManager],
++        group_pool: dict[int, int],
++        pool_offsets: list[int],
++    ):
++        self.medium: Medium = Medium.CPU
++        self._pools = pools
++        self._group_pool = group_pool
++        self._pool_offsets = pool_offsets
++
++    def _pool_of(self, key: OffloadKey) -> int:
++        return self._group_pool.get(get_offload_group_idx(key), 0)
++
++    def _split(self, keys: Iterable[OffloadKey]) -> dict[int, list[OffloadKey]]:
++        split: dict[int, list[OffloadKey]] = {}
++        for key in keys:
++            split.setdefault(self._pool_of(key), []).append(key)
++        return split
++
++    def _ctx(self, req_context: ReqContext, pool: int):
++        return _PoolReqContext(req_context, pool)
++
++    def _merge_ids(
++        self,
++        keys: list[OffloadKey],
++        per_pool: dict[int, tuple[list[OffloadKey], LoadStoreSpec]],
++    ) -> CPULoadStoreSpec:
++        ids: dict[OffloadKey, int] = {}
++        for pool, (pool_keys, spec) in per_pool.items():
++            assert isinstance(spec, CPULoadStoreSpec)
++            offset = self._pool_offsets[pool]
++            for key, chunk_id in zip(pool_keys, spec.block_ids):
++                ids[key] = int(chunk_id) + offset
++        return CPULoadStoreSpec([ids[key] for key in keys])
++
++    @override
++    def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
++        for pool, manager in enumerate(self._pools):
++            manager.on_new_request(self._ctx(req_context, pool))
++        return RequestOffloadingContext()
++
++    @override
++    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
++        pool = self._pool_of(key)
++        return self._pools[pool].lookup(key, self._ctx(req_context, pool))
++
++    @override
++    def prepare_load(
++        self,
++        keys: Collection[OffloadKey],
++        req_context: ReqContext,
++    ) -> LoadStoreSpec:
++        keys = list(keys)
++        per_pool = {
++            pool: (
++                pool_keys,
++                self._pools[pool].prepare_load(pool_keys, self._ctx(req_context, pool)),
++            )
++            for pool, pool_keys in self._split(keys).items()
++        }
++        return self._merge_ids(keys, per_pool)
++
++    @override
++    def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
++        for pool, pool_keys in self._split(keys).items():
++            self._pools[pool].touch(pool_keys, self._ctx(req_context, pool))
++
++    @override
++    def complete_load(
++        self, keys: Collection[OffloadKey], req_context: ReqContext
++    ) -> None:
++        for pool, pool_keys in self._split(keys).items():
++            self._pools[pool].complete_load(pool_keys, self._ctx(req_context, pool))
++
++    @override
++    def prepare_store(
++        self,
++        keys: Collection[OffloadKey],
++        req_context: ReqContext,
++    ) -> PrepareStoreOutput | None:
++        keys = list(keys)
++        outputs: dict[int, PrepareStoreOutput] = {}
++        for pool, pool_keys in self._split(keys).items():
++            output = self._pools[pool].prepare_store(
++                pool_keys, self._ctx(req_context, pool)
++            )
++            if output is None:
++                # All or nothing: release what the other pools reserved.
++                for done_pool, done in outputs.items():
++                    self._pools[done_pool].complete_store(
++                        done.keys_to_store,
++                        self._ctx(req_context, done_pool),
++                        success=False,
++                    )
++                return None
++            outputs[pool] = output
++        to_store = {key for out in outputs.values() for key in out.keys_to_store}
++        keys_to_store = [key for key in keys if key in to_store]
++        store_spec = self._merge_ids(
++            keys_to_store,
++            {
++                pool: (out.keys_to_store, out.store_spec)
++                for pool, out in outputs.items()
++            },
++        )
++        return PrepareStoreOutput(
++            keys_to_store=keys_to_store,
++            store_spec=store_spec,
++            evicted_keys=[key for out in outputs.values() for key in out.evicted_keys],
++        )
++
++    @override
++    def complete_store(
++        self,
++        keys: Collection[OffloadKey],
++        req_context: ReqContext,
++        success: bool = True,
++    ) -> None:
++        for pool, pool_keys in self._split(keys).items():
++            self._pools[pool].complete_store(
++                pool_keys, self._ctx(req_context, pool), success=success
++            )
++
++    @override
++    def on_request_finished(self, req_context: ReqContext) -> None:
++        for pool, manager in enumerate(self._pools):
++            manager.on_request_finished(self._ctx(req_context, pool))
++
++    @override
++    def on_schedule_end(self, context) -> None:
++        for manager in self._pools:
++            manager.on_schedule_end(context)
++
++    @override
++    def has_pending_work(self) -> bool:
++        return any(manager.has_pending_work() for manager in self._pools)
++
++    @override
++    def reset_cache(self) -> None:
++        for manager in self._pools:
++            manager.reset_cache()
++
++    @override
++    def take_events(self) -> Iterable[OffloadingEvent]:
++        for manager in self._pools:
++            yield from manager.take_events()
++
++    def get_stats(self) -> OffloadingConnectorStats | None:
++        # Every pool clears its per-step counters; report the first pool
++        # (the largest host rows), which fills up first.
++        stats = [manager.get_stats() for manager in self._pools]
++        return stats[0]
++
++    @override
++    def shutdown(self) -> None:
++        for manager in self._pools:
++            manager.shutdown()
+diff -ruN a/vllm/v1/kv_offload/cpu/spec.py b/vllm/v1/kv_offload/cpu/spec.py
+--- a/vllm/v1/kv_offload/cpu/spec.py	2026-10-20 23:15:03.229222873 +0700
++++ b/vllm/v1/kv_offload/cpu/spec.py	2026-10-20 23:54:27.926725778 +0700
+@@ -5,6 +5,7 @@
+ import torch
+ from typing_extensions import override
+ 
++from vllm.logger import init_logger
+ from vllm.platforms import current_platform
+ from vllm.utils.math_utils import round_up
+ from vllm.v1.kv_offload.base import (
+@@ -20,7 +21,10 @@
+ from vllm.v1.kv_offload.config import OffloadingConfig
+ from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
+ from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+-from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
++from vllm.v1.kv_offload.cpu.manager import (
++    CPUOffloadingManager,
++    PooledCPUOffloadingManager,
++)
+ from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+ 
+ 
+@@ -41,6 +45,9 @@
+     group.barrier()
+ 
+ 
++logger = init_logger(__name__)
++
++
+ class CPUOffloadingSpec(OffloadingSpec):
+     BLOCK_SIZE_ALIGNMENT = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+ 
+@@ -126,6 +133,49 @@
+             # or |--- C0 (single copy) ---| *** maybe-pad *** |
+             self.kv_bytes_per_chunk = aligned_kv_bytes_per_chunk
+ 
++        # local-08: groups with host-resident K/V get chunk pools of their own,
++        # one per distinct host size, so host bytes are reserved only where
++        # they are used. A pool without host bytes holds the per-request
++        # state checkpoints (one chunk per Mamba group and request), so it
++        # gets VLLM_KV_OFFLOAD_STATE_POOL_WEIGHT (default 4) times the chunks
++        # of a host pool; its chunks hold only the GPU part.
++        self.pool_sizes = [self.num_chunks]
++        self.pool_offsets = [0]
++        self.group_pool: dict[int, int] = {}
++        self.pool_host_bytes: list[int] = [0]
++        if config.group_host_bytes and self.kv_bytes_per_chunk > 0:
++            import os
++
++            sizes = {config.group_host_bytes.get(g.group_id, 0) for g in config.groups}
++            self.pool_host_bytes = sorted(sizes, reverse=True)
++            self.group_pool = {
++                g.group_id: self.pool_host_bytes.index(
++                    config.group_host_bytes.get(g.group_id, 0)
++                )
++                for g in config.groups
++            }
++            state_weight = int(os.environ.get("VLLM_KV_OFFLOAD_STATE_POOL_WEIGHT", "4"))
++            weights = [1 if host else state_weight for host in self.pool_host_bytes]
++            pool_unit = sum(
++                weight
++                * (self.kv_bytes_per_chunk + host * world_size * self.blocks_per_chunk)
++                for weight, host in zip(weights, self.pool_host_bytes)
++            )
++            unit_chunks = int(cpu_bytes_to_use) // pool_unit
++            self.pool_sizes = [weight * unit_chunks for weight in weights]
++            self.pool_offsets = [
++                sum(self.pool_sizes[:pool]) for pool in range(len(self.pool_sizes))
++            ]
++            self.num_chunks = sum(self.pool_sizes)
++        # Printed by the scheduler and by every worker: they must agree.
++        logger.info(
++            "KV offload pools: chunks per pool %s, host bytes per pool %s, "
++            "groups by pool %s",
++            self.pool_sizes,
++            self.pool_host_bytes,
++            self.group_pool or "all in pool 0",
++        )
++
+         # scheduler-side
+         self._manager: OffloadingManager | None = None
+ 
+@@ -149,14 +199,24 @@
+             # Maximum entries in the internal tracker's LRU table.
+             max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
+ 
+-            self._manager = CPUOffloadingManager(
+-                num_chunks=self.num_chunks,
+-                cache_policy=self.eviction_policy,
+-                cache_policy_module_path=self.cache_policy_module_path,
+-                enable_events=self.kv_events_config.enable_kv_cache_events,
+-                store_threshold=store_threshold,
+-                max_tracker_size=max_tracker_size,
+-            )
++            def make_manager(num_chunks: int) -> CPUOffloadingManager:
++                return CPUOffloadingManager(
++                    num_chunks=num_chunks,
++                    cache_policy=self.eviction_policy,
++                    cache_policy_module_path=self.cache_policy_module_path,
++                    enable_events=self.kv_events_config.enable_kv_cache_events,
++                    store_threshold=store_threshold,
++                    max_tracker_size=max_tracker_size,
++                )
++
++            if self.group_pool:
++                self._manager = PooledCPUOffloadingManager(
++                    [make_manager(size) for size in self.pool_sizes],
++                    self.group_pool,
++                    self.pool_offsets,
++                )
++            else:
++                self._manager = make_manager(self.num_chunks)
+         return self._manager
+ 
+     def _uses_shared_region(self) -> bool:
+@@ -185,6 +245,15 @@
+                 barrier=_all_workers_barrier,
+             )
+         try:
++            # local-08: host-resident tensors go to their group's pool rows.
++            for tensor in kv_caches.tensors:
++                group_id = getattr(tensor, "host_group_id", None)
++                if group_id is not None:
++                    pool = self.group_pool.get(group_id, 0)
++                    tensor.host_pool_rows = (
++                        self.pool_offsets[pool],
++                        self.pool_sizes[pool],
++                    )
+             return CPUOffloadingWorker(
+                 kv_caches=kv_caches,
+                 blocks_per_chunk=self.blocks_per_chunk,
+diff -ruN a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+--- a/vllm/v1/worker/utils.py	2026-10-20 22:26:53.168603770 +0700
++++ b/vllm/v1/worker/utils.py	2026-10-20 22:27:28.998575440 +0700
+@@ -699,6 +699,14 @@
+ ] = []
+ 
+ 
++# local-08: the same host-resident storage, by layer name, for KV offloading.
++# Each view is a device (UVA) tensor whose first dimension is the block id. The
++# offload connector copies it with the layer's GPU block; the load hooks get
++# the destination block ids of every CPU->GPU load, before the load is queued.
++KV_CACHE_HOST_RESIDENT_VIEWS: dict[str, torch.Tensor] = {}
++KV_CACHE_BLOCK_LOAD_HOOKS: list[Callable[[np.ndarray], None]] = []
++
++
+ def copy_kv_cache_blocks_inplace(
+     kv_caches: Iterable[torch.Tensor],
+     num_blocks: int,

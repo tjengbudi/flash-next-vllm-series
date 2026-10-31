@@ -1,0 +1,139 @@
+If you would like to merge this patch upstream, I would appreciate it if you could keep me credited as the commit author, or add the following trailer to the commit message: 
+
+Co-authored-by: Minachist <84688797+aiueonicked@users.noreply.github.com>
+
+Qwen3.8-Flash-Next MTP patch 02: the draft head on three cards.
+
+vllm/models/qwen4_exp/nvidia/mtp.py
+
+Needs flash-next-mtp-01-enable.patch and flash-next-mem-01-pp-embed-head.patch.
+
+On 3 x RTX 3090 the drafter sits on the last pipeline rank next to 15 body
+layers (VLLM_PP_LAYER_PARTITION=16,17,15) and its INT4 routed experts. Two of
+its own tensors do not need to be on that GPU:
+
+- lm_head. The drafter built a quantized copy of the target's head, only for
+  load_eagle_model() to replace it with the target's own head, which is on
+  the same rank, right after loading. Building it cost its Marlin repack
+  (0.6 GiB) during the load. It is now a PPMissingLayer, and the loader skips
+  the checkpoint's lm_head for it.
+- embed_tokens. Under PP > 1 the drafter keeps its own input embedding
+  (0.60 GiB INT8), from which a step gathers a few rows. With
+  VLLM_MTP_EMBED_ON_HOST=1 (the default) it is built and loaded on the host,
+  and after loading its table is left in pinned host memory behind a UVA view.
+
+diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
+index a07180b..de74e79 100644
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -13,7 +13,9 @@ The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
+     multi stream [T, hc_count*H] (fed to the next draft step).
+ """
+ 
++import os
+ from collections.abc import Iterable
++from contextlib import nullcontext
+ 
+ import regex as re
+ import torch
+@@ -27,10 +29,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
+ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+ from vllm.model_executor.layers.linear import ColumnParallelLinear
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+-from vllm.model_executor.layers.vocab_parallel_embedding import (
+-    ParallelLMHead,
+-    VocabParallelEmbedding,
+-)
++from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+ from vllm.model_executor.model_loader.utils import configure_quant_config
+ from vllm.model_executor.models.interfaces import SupportsPP
+ from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
+@@ -190,12 +189,20 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+         # in v1/worker/gpu/spec_decode/eagle/utils.py returns early instead of
+         # sharing across ranks. Build it with the checkpoint's quantization, or
+         # a quantized embed_tokens cannot be loaded into it at all.
+-        self.embed_tokens = VocabParallelEmbedding(
+-            self.vocab_size,
+-            self.hidden_size,
+-            quant_config=draft_vllm_config.quant_config,
+-            prefix=maybe_prefix(prefix, "embed_tokens"),
+-        )
++        #
++        # That copy is 0.60 GiB (INT8) on the last rank, and a step gathers at
++        # most a few rows from it. With VLLM_MTP_EMBED_ON_HOST=1 (the default)
++        # it is built and loaded on the host, and move_embed_to_host() leaves
++        # the table in pinned host memory behind a UVA view.
++        self._embed_on_host = os.environ.get("VLLM_MTP_EMBED_ON_HOST", "1") == "1"
++        self._device = torch.get_default_device()
++        with torch.device("cpu") if self._embed_on_host else nullcontext():
++            self.embed_tokens = VocabParallelEmbedding(
++                self.vocab_size,
++                self.hidden_size,
++                quant_config=draft_vllm_config.quant_config,
++                prefix=maybe_prefix(prefix, "embed_tokens"),
++            )
+         with set_current_vllm_config(draft_vllm_config, prefix=prefix):
+             # residual_linear_shared fusion: fc_embedding projects the token
+             # embedding, fc_hidden (shared across HC branches) projects the
+@@ -283,6 +290,22 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+ 
++    def move_embed_to_host(self) -> None:
++        """After loading: large embed tensors become UVA views of pinned host
++        memory, small ones (scales) go to the GPU."""
++        if not self._embed_on_host or isinstance(self.embed_tokens, PPMissingLayer):
++            return
++        from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
++
++        for p in self.embed_tokens.parameters():
++            if p.device.type != "cpu":
++                continue
++            if p.numel() * p.element_size() >= 64 * 2**20:
++                host = p.data if p.data.is_pinned() else p.data.pin_memory()
++                p.data = get_accelerator_view_from_cpu_tensor(host)
++            else:
++                p.data = p.data.to(self._device)
++
+     def forward(
+         self,
+         input_ids: torch.Tensor | None,
+@@ -406,21 +429,14 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+             prefix=maybe_prefix(prefix, "mtp"),
+         )
+ 
+-        if get_pp_group().is_last_rank:
+-            if config.tie_word_embeddings:
+-                self.lm_head = self.model.embed_tokens
+-            else:
+-                # Quantized like the target's head, because checkpoint holds
+-                # that. It is replaced by the target's own head
+-                # right after loading (maybe_share_target_lm_head), so this
+-                # copy only need to survive the load.
+-                self.lm_head = ParallelLMHead(
+-                    config.vocab_size,
+-                    config.hidden_size,
+-                    quant_config=self.quant_config,
+-                    prefix=maybe_prefix(prefix, "lm_head"),
+-                )
++        if get_pp_group().is_last_rank and config.tie_word_embeddings:
++            self.lm_head = self.model.embed_tokens
+         else:
++            # Right after loading, load_eagle_model() replaces this with the
++            # target's own head, which is on the same (last) rank. Building a
++            # quantized copy first only to drop it costs its Marlin repack on
++            # that rank during the load (0.6 GiB), which three cards do not
++            # have; the loader skips the checkpoint's lm_head for it.
+             self.lm_head = PPMissingLayer()
+ 
+         self.logits_processor = LogitsProcessor(config.vocab_size)
+@@ -451,6 +467,9 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+             spec_step_idx=spec_step_idx,
+         )
+ 
++    def process_weights_after_loading(self) -> None:
++        self.model.move_embed_to_host()
++
+     def compute_logits(
+         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
+     ) -> torch.Tensor | None:

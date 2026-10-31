@@ -1,0 +1,66 @@
+Qwen3.8-Flash-Next vLLM v0.31.0 patch series (local-01 .. local-64)
+Copyright 2026 tjengbudi
+
+This product includes software developed by the vLLM Project
+(https://github.com/vllm-project/vllm), licensed under the Apache License,
+Version 2.0. See LICENSE for the full license text.
+
+Every patch in patches/ is a derivative work of vLLM and stays under the Apache
+License, Version 2.0. The patches apply to vllm/vllm-openai:v0.31.0.
+
+==============================================================================
+Patches 001-015: Minachist
+==============================================================================
+
+patches/001 .. 015 (flash-next-*, upstream-01, mtp-01 .. mtp-03) are Minachist's
+"Qwen3.8-Flash-Next support for vLLM"
+(https://huggingface.co/Minachist/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound,
+vllm-patch/), Copyright 2026 Minachist, Apache-2.0. They were regenerated for
+vLLM 0.31.0 from Minachist's 0.29.1rc1.dev47+gdc36fcce9 / 0.30.0 versions. The
+port notes at the top of each patch say what changed in the port.
+
+Minachist asks: if you would like to merge these patches upstream, keep
+Minachist credited as the commit author, or add this trailer to the commit:
+  Co-authored-by: Minachist <84688797+aiueonicked@users.noreply.github.com>
+
+patches/012 (flash-next-upstream-01-mamba-align-req-slot) is not Minachist's
+work. It is vLLM pull request #55506
+(https://github.com/vllm-project/vllm/pull/55506) by Karl0007, contributed to
+vLLM under the Apache License, Version 2.0. The root cause was first found by
+zebgop-ops (https://github.com/zebgop-ops/qwen38-flashnext-pp).
+
+files/make_mtp_int4.py is Minachist's, Copyright (c) 2026 Minachist, MIT
+license (header of the file; full text in LICENSE.MIT).
+
+==============================================================================
+Patches 016-060: tjengbudi, and the upstream work they port
+==============================================================================
+
+patches/016 .. 060 (local-*) were written by tjengbudi (2026-10). Apache-2.0.
+
+Several of them port or re-base upstream vLLM pull requests and commits, by
+the vLLM contributors who wrote them, contributed to vLLM under the Apache
+License, Version 2.0. PATCHES.md names each one in its "Source" column
+(among them #55557, #58763, #58863, #59299, #59853, #59880, #60615, #40704,
+#61192, #61219, #54627, #64425, #64458, #64628, and vLLM main c32575477 with
+the open pull requests that local-47 lists in its header).
+
+patches/058 (local-61) takes its MTP weight-name prefilter from
+roozich/Qwen3.8-Flash-Spark (https://github.com/roozich/Qwen3.8-Flash-Spark),
+Copyright 2026 blazux, Apache License, Version 2.0.
+
+patches/060 (local-64) follows the two-letter choice labels of SGLang's
+decisions API (idea only, no SGLang code).
+
+files/make_ple_int8.py and the other files in files/ (MTP draft-vocabulary id
+lists), apply.sh, verify.sh, Dockerfile and examples/compose.yml were written
+by tjengbudi, Apache-2.0. examples/compose.yml started from the club-3090
+compose layout (https://github.com/noonghunna/club-3090).
+
+==============================================================================
+Not covered
+==============================================================================
+
+No model weights are in this repository. The weights these patches serve carry
+their own licenses (Qwen Community License 1.0, Swift Open License v1.0); see
+the model repositories.

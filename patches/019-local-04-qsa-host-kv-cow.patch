@@ -1,0 +1,203 @@
+Local (budi, 2026-10-11, rev 2): copy-on-write for QSA host K/V.
+
+Symptom: with --prefix-match-unit finer than the QSA block, any prefix-cache
+hit that ends inside a block corrupted the output (2026-10-02 echo probe: 9/9
+exact without a hit, 0/6 with one). Whole-block hits were fine.
+
+Cause: vLLM serves a partial-block hit by giving the request a fresh block and
+copying the shared one into it (kv_cache_block_copies ->
+copy_kv_cache_blocks_inplace over the runner's kv_caches). With
+VLLM_QSA_KV_OFFLOAD=1 a QSA layer's kv_caches entry is only the 1-byte GPU
+slot per token; the real K/V lives in the pinned host pool made in
+bind_kv_cache, which nothing copied. The new block kept its previous owner's
+K/V. (The DeltaNet side was never the problem: MambaManager stores the
+partial-tail checkpoint and copies it through the same list.)
+
+Fix: copy_kv_cache_blocks_inplace runs registered hooks after its own copies.
+The GPU model runner passes, for each copy target, the layer names of the KV
+cache group that owns it. QSA registers a hook that copies a layer's host
+blocks only for targets in its own group, block by block inside the mapped
+host pool, and drops the decode row cache (keyed by physical slot).
+
+rev 2: rev 1 gathered every pair through a GPU temporary. One hit makes one
+copy per KV cache group (~13 here, mostly mamba), so three concurrent hits
+asked for 726 MiB on a full GPU and killed the engine (MTP slug, bf16 KV).
+
+Port for the MTP + FP8-KV tree: applies on top of local-03
+(flash-next-vllm-mtp:v030-fp8kv). Same change as the fp8kv copy, context differs.
+
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index 5911e7f..e5b3c84 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -248,6 +248,68 @@ def _qsa_pin_host_pool(
+     return host, buf
+ 
+ 
++# Host K/V views (UVA) of the QSA layers on this rank, by layer name.
++_QSA_HOST_KV_VIEWS: dict[str, torch.Tensor] = {}
++_QSA_COW_UNMAPPED_WARNED = False
++
++
++def _qsa_copy_host_kv_blocks(indices_np, num_blocks: int, dst_block_layers=None) -> None:
++    """Copy-on-write for host-resident K/V.
++
++    A prefix-cache hit that ends inside a block (--prefix-match-unit finer than
++    the QSA block) gives the request a fresh block and asks the worker to copy
++    the shared block into it. The generic copy only sees the GPU tensors in
++    kv_caches; with VLLM_QSA_KV_OFFLOAD=1 those hold a 1-byte slot per token
++    and the real K/V stays in pinned host memory. Without this the new block
++    keeps a previous owner's K/V and the request attends to garbage.
++
++    One hit makes one copy per KV cache group, most of them for mamba groups,
++    so a layer copies only the pairs whose target block belongs to its own
++    group (dst_block_layers). A target the caller could not map is copied
++    anyway. Each pair is one block-to-block copy inside the mapped host pool:
++    no GPU temporary (a batched gather of ~40 bf16 blocks needed 726 MiB and
++    ran a full GPU out of memory). The copies run on the current stream, after
++    earlier K/V writes and before this step's forward reads the blocks.
++    """
++    global _QSA_COW_UNMAPPED_WARNED
++    if not _QSA_HOST_KV_VIEWS:
++        return
++    from .ops.qsa import _QSA_ROW_CACHES
++
++    pairs = [(int(src), int(dst)) for src, dst in indices_np]
++    devices = set()
++    for name, view in _QSA_HOST_KV_VIEWS.items():
++        blocks = None
++        for src, dst in pairs:
++            if dst_block_layers is not None:
++                layers = dst_block_layers.get(dst)
++                if layers is None:
++                    if not _QSA_COW_UNMAPPED_WARNED:
++                        _QSA_COW_UNMAPPED_WARNED = True
++                        from vllm.logger import init_logger
++
++                        init_logger(__name__).warning(
++                            "QSA host KV copy-on-write: block %d has no KV cache "
++                            "group in this step's block ids; copying it anyway.",
++                            dst,
++                        )
++                elif name not in layers:
++                    continue
++            if blocks is None:
++                # Bytes, so FP8 K/V needs no float8 kernels.
++                blocks = view.view(torch.uint8).view(num_blocks, -1)
++            blocks[dst].copy_(blocks[src])
++        if blocks is not None:
++            devices.add(view.device)
++    if not devices:
++        return
++    # The decode row cache is keyed by physical slot; rows it holds for the
++    # destination blocks belong to their previous owner.
++    for row_cache in _QSA_ROW_CACHES.values():
++        if row_cache.tags.device in devices:
++            row_cache.invalidate_all()
++
++
+ def _qsa_staged_prefill(
+     layer,
+     query,
+@@ -768,6 +830,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+         )
+         self._qsa_gpu_slots = kv_cache
+         self.kv_cache = get_accelerator_view_from_cpu_tensor(self._qsa_host_kv)
++        _QSA_HOST_KV_VIEWS[self.layer_name] = self.kv_cache
++        from vllm.v1.worker.utils import KV_CACHE_BLOCK_COPY_HOOKS
++
++        if _qsa_copy_host_kv_blocks not in KV_CACHE_BLOCK_COPY_HOOKS:
++            KV_CACHE_BLOCK_COPY_HOOKS.append(_qsa_copy_host_kv_blocks)
+         init_logger(__name__).info(
+             "QSA host KV %s: %d blocks x %d tokens, %.3f GiB pinned (UVA), "
+             "%.1f GiB for all %d QSA layers",
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index c9d79a9..9ea954d 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1232,8 +1232,39 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.kv_caches,
+                 self.kv_cache_config.num_blocks,
+                 scheduler_output.kv_cache_block_copies,
++                dst_block_layers=self._cow_dst_block_layers(scheduler_output),
+             )
+ 
++    def _cow_dst_block_layers(
++        self, scheduler_output: SchedulerOutput
++    ) -> dict[int, frozenset[str]]:
++        """Layer names of the KV cache group each copy-on-write target belongs to.
++
++        One partial-block hit makes one copy per KV cache group (attention and
++        mamba alike). Hooks that copy storage outside kv_caches use this to
++        skip the copies of groups their layers are not in.
++        """
++        copies = scheduler_output.kv_cache_block_copies or ()
++        dsts = {copy.dst_block_id for copy in copies}
++        groups = self.kv_cache_config.kv_cache_groups
++        found: dict[int, frozenset[str]] = {}
++
++        def scan(block_ids) -> None:
++            if block_ids is None:
++                return
++            for group_id, ids in enumerate(block_ids):
++                for block_id in ids:
++                    if block_id in dsts and block_id not in found:
++                        found[block_id] = frozenset(groups[group_id].layer_names)
++
++        for new_req in scheduler_output.scheduled_new_reqs:
++            scan(new_req.block_ids)
++        for block_ids in scheduler_output.scheduled_cached_reqs.new_block_ids:
++            scan(block_ids)
++        for block_ids in (scheduler_output.block_table_updates or {}).values():
++            scan(block_ids)
++        return found
++
+     def gather_batch_req_state(
+         self, scheduler_output: SchedulerOutput, dummy_run: bool
+     ) -> tuple["BatchReqState | None", int | None]:
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index a6ef84b..23d8d73 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import math
+ from collections import defaultdict
+-from collections.abc import Iterable, Mapping, Sequence
++from collections.abc import Callable, Iterable, Mapping, Sequence
+ from dataclasses import dataclass, field
+ from itertools import product as iprod
+ from typing import Any
+@@ -688,10 +688,22 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
+                 layer.impl._v_scale_cache = None
+ 
+ 
++# Storage that copy-on-write must also copy but that is not in kv_caches,
++# e.g. K/V a layer keeps in host memory (Qwen4Exp QSA with
++# VLLM_QSA_KV_OFFLOAD=1). Each hook gets the (N, 2) src/dst block-id array, the
++# number of scheduler blocks and dst_block_layers (dst block id -> layer names
++# of the KV cache group that owns it, or None when the caller has no map), and
++# runs after the kv_caches copies.
++KV_CACHE_BLOCK_COPY_HOOKS: list[
++    Callable[[np.ndarray, int, Mapping[int, frozenset[str]] | None], None]
++] = []
++
++
+ def copy_kv_cache_blocks_inplace(
+     kv_caches: Iterable[torch.Tensor],
+     num_blocks: int,
+     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
++    dst_block_layers: Mapping[int, frozenset[str]] | None = None,
+ ) -> None:
+     if not kv_cache_block_copies:
+         return
+@@ -736,6 +748,9 @@ def copy_kv_cache_blocks_inplace(
+             blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
+         blocks[dst] = blocks[src]
+ 
++    for hook in KV_CACHE_BLOCK_COPY_HOOKS:
++        hook(indices_np, num_blocks, dst_block_layers)
++
+ 
+ def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:
+     """Whether every request in the batch has the same query length.

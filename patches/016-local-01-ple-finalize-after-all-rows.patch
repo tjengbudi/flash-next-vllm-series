@@ -1,0 +1,30 @@
+diff --git a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+index 451a085..adf567a 100644
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+@@ -875,6 +875,10 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+             )
+         self._mmap_array: "np.memmap | None" = None
+         self._mmap_prefilled = False
++        # Rows copied into the table so far. The PLE hash buffers and the
++        # n-gram shards arrive in separate load_weights calls (they live in
++        # different checkpoint files), so finalize must wait for every row.
++        self._mmap_rows_loaded = 0
+         # Skip Qwen4ExpPLEPinnedHostEmbedding.__init__, which requires UVA. The
+         # other methods of that class are reused.
+         Qwen4ExpPLEEmbedding.__init__(
+@@ -1036,11 +1040,14 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+         if self._mmap_prefilled:
+             return
+         super().weight_loader(param, loaded_weight, checkpoint_start)
++        self._mmap_rows_loaded += int(loaded_weight.shape[0])
+ 
+     def finalize_mmap_cache(self) -> None:
+         """Flush a freshly filled table so the next run can skip loading."""
+         if self._mmap_prefilled or self._mmap_array is None:
+             return
++        if self._mmap_rows_loaded < self.org_vocab_size:
++            return
+         self._mmap_array.flush()
+         self._mmap_prefilled = True
+         logger.info("PLE table written to %s", self._mmap_path)

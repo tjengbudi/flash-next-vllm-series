@@ -1,0 +1,285 @@
+diff -ruN a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+--- a/vllm/model_executor/layers/linear.py	2026-10-29 18:51:30.316517413 +0700
++++ b/vllm/model_executor/layers/linear.py	2026-10-29 18:52:12.090492170 +0700
+@@ -5,6 +5,8 @@
+ from collections.abc import Callable, Iterable
+ from typing import Any
+ 
++import os
++
+ import torch
+ from torch.nn.parameter import Parameter
+ from typing_extensions import TypeIs
+@@ -162,6 +164,38 @@
+         raise NotImplementedError
+ 
+ 
++# local-53: decode-sized (<= 16 rows) unquantized GEMMs through a Triton kernel
++# that streams the weight at memory bandwidth (ops/skinny.py of qwen4_exp).
++# A layer carrying _skinny_w8 / _skinny_s (an int8 copy with per-row scales,
++# set by the Qwen4Exp MTP drafter under VLLM_MTP_INT8_DENSE=1) uses that copy;
++# VLLM_SKINNY_BF16=1 sends the other bf16 weights through the bf16 kernel.
++_SKINNY_BF16 = os.environ.get("VLLM_SKINNY_BF16", "0").strip() == "1"
++
++
++def _skinny_apply(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor | None:
++    q = getattr(layer, "_skinny_w8", None)
++    w = layer.weight
++    if q is None and not (
++        _SKINNY_BF16
++        and w.dtype == torch.bfloat16
++        and w.dim() == 2
++        and w.stride(1) == 1
++    ):
++        return None
++    if x.dtype != torch.bfloat16 or x.shape[-1] != w.shape[1]:
++        return None
++    from vllm.models.qwen4_exp.nvidia.ops.skinny import skinny_linear
++
++    x2 = x.reshape(-1, x.shape[-1])
++    if x2.stride(-1) != 1:
++        x2 = x2.contiguous()
++    if q is not None:
++        y = skinny_linear(x2, q, layer._skinny_s)
++    else:
++        y = skinny_linear(x2, w)
++    return y.reshape(*x.shape[:-1], w.shape[0])
++
++
+ class UnquantizedLinearMethod(LinearMethodBase):
+     """Linear method without quantization."""
+ 
+@@ -236,6 +270,10 @@
+             current_platform.is_cuda_alike() or current_platform.is_xpu()
+         ):
+             return linear_batch_invariant(x, layer.weight, bias)
++        if x.is_cuda and x.dim() >= 2 and x.numel() <= 16 * x.shape[-1]:
++            y = _skinny_apply(layer, x)
++            if y is not None:
++                return y if bias is None else y + bias
+         return self._gemm_impl(layer, x, layer.weight, bias)
+ 
+ 
+Binary files a/vllm/model_executor/layers/__pycache__/linear.cpython-312.pyc and b/vllm/model_executor/layers/__pycache__/linear.cpython-312.pyc differ
+diff -ruN a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py	2026-10-29 18:51:30.790517130 +0700
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py	2026-10-29 18:52:47.400470456 +0700
+@@ -603,6 +603,54 @@
+     def process_weights_after_loading(self) -> None:
+         self.model.move_embed_to_host()
+         self._maybe_build_draft_vocab_head()
++        self._maybe_int8_dense()
++
++    def _maybe_int8_dense(self) -> None:
++        """local-53: VLLM_MTP_INT8_DENSE=1 gives the drafter's large bf16 linears
++        (q/k/v, o_proj, fc_*, shared expert, indexer projection) an int8 copy with
++        per-row scales for decode-sized steps (<= 16 rows; see _skinny_apply in
++        linear.py). Larger batches keep the bf16 weight. Only drafts change; the
++        target verifies every token, so output is unchanged and only the
++        acceptance rate can move. MoE router gates stay bf16."""
++        if os.environ.get("VLLM_MTP_INT8_DENSE", "0").strip() != "1":
++            return
++        from vllm.model_executor.layers.linear import (
++            LinearBase,
++            UnquantizedLinearMethod,
++        )
++        from vllm.models.qwen4_exp.nvidia.ops.skinny import quant_int8_rows
++
++        done, nbytes = [], 0
++        for name, module in self.named_modules():
++            w = getattr(module, "weight", None)
++            if (
++                not isinstance(module, LinearBase)
++                or not isinstance(module.quant_method, UnquantizedLinearMethod)
++                or w is None
++                or w.dtype != torch.bfloat16
++                or w.dim() != 2
++                or w.numel() < (1 << 20)
++                or name.endswith(".gate")
++            ):
++                continue
++            with torch.no_grad():
++                q, s = quant_int8_rows(w.data)
++            module._skinny_w8, module._skinny_s = q.contiguous(), s.contiguous()
++            # Build the kernel variants now, not inside a decode graph capture.
++            from vllm.models.qwen4_exp.nvidia.ops.skinny import skinny_linear
++
++            for rows in (1, 2, 3):
++                skinny_linear(
++                    torch.zeros(rows, w.shape[1], dtype=w.dtype, device=w.device),
++                    module._skinny_w8,
++                    module._skinny_s,
++                )
++            done.append(name.rsplit(".", 2)[-2] + "." + name.rsplit(".", 1)[-1])
++            nbytes += q.numel() + s.numel() * 4
++        logger.info(
++            "local-53: MTP int8 dense copies for %d linears (%.0f MiB): %s",
++            len(done), nbytes / 2**20, ", ".join(done),
++        )
+ 
+     def _draft_vocab_rows(self, weight: torch.Tensor) -> torch.Tensor:
+         ids = self._draft_vocab_load_ids
+Binary files a/vllm/models/qwen4_exp/nvidia/ops/__pycache__/skinny.cpython-312.pyc and b/vllm/models/qwen4_exp/nvidia/ops/__pycache__/skinny.cpython-312.pyc differ
+diff -ruN a/vllm/models/qwen4_exp/nvidia/ops/skinny.py b/vllm/models/qwen4_exp/nvidia/ops/skinny.py
+--- a/vllm/models/qwen4_exp/nvidia/ops/skinny.py	1970-01-01 07:00:00.000000000 +0700
++++ b/vllm/models/qwen4_exp/nvidia/ops/skinny.py	2026-10-29 18:52:12.089492171 +0700
+@@ -0,0 +1,100 @@
++# SPDX-License-Identifier: Apache-2.0
++"""local-53: small-batch GEMM and compact top-k sampling for decode on sm_86.
++
++skinny_linear: y = x @ w.T for x with at most 16 rows (decode / verify / MTP draft
++steps), w bf16 or int8 with a per-row scale. At these sizes the GEMM only streams
++the weight, and cuBLAS' kernels for them run below memory bandwidth on Ampere.
++
++compact_top_k_top_p: the top-k / top-p mask of apply_top_k_top_p when every row
++has 1 <= top_k <= 32, found through per-block top-32 candidates instead of a
++search over the whole vocabulary.
++"""
++import torch, triton, triton.language as tl
++
++@triton.jit
++def _skinny_kernel(x_ptr, w_ptr, s_ptr, out_ptr, M, N, K, stride_xm, stride_wn, stride_om,
++                   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
++                   SPLIT_K: tl.constexpr, IS_INT8: tl.constexpr):
++    pid_n = tl.program_id(0); pid_k = tl.program_id(1)
++    offs_m = tl.arange(0, BLOCK_M); offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++    k_per = tl.cdiv(K, SPLIT_K * BLOCK_K) * BLOCK_K
++    k_lo = pid_k * k_per
++    for k0 in range(k_lo, tl.minimum(k_lo + k_per, K), BLOCK_K):
++        offs_k = k0 + tl.arange(0, BLOCK_K)
++        x = tl.load(x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :],
++                    mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
++        w = tl.load(w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :],
++                    mask=(offs_n[:, None] < N) & (offs_k[None, :] < K), other=0)
++        if IS_INT8:
++            w = w.to(tl.bfloat16)
++        acc += tl.dot(x, tl.trans(w))
++    if IS_INT8:
++        s = tl.load(s_ptr + offs_n, mask=offs_n < N, other=0.0)
++        acc = acc * s[None, :]
++    optr = out_ptr + pid_k * M * N + offs_m[:, None] * stride_om + offs_n[None, :]
++    tl.store(optr, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
++
++_NUM_SMS: dict = {}
++
++
++def skinny_linear(x, w, scale=None, num_sms=None):
++    """y = x @ w.T (* scale) for x [M<=16, K] bf16, w [N, K] bf16 or int8 (per-row scale)."""
++    if num_sms is None:
++        num_sms = _NUM_SMS.get(x.device)
++        if num_sms is None:
++            num_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
++            _NUM_SMS[x.device] = num_sms
++    M, K = x.shape; N = w.shape[0]
++    BLOCK_N, BLOCK_K = 32, 128
++    nb = triton.cdiv(N, BLOCK_N)
++    split = 1
++    while nb * split < 2 * num_sms and split < 8 and K // (split * 2) >= 4 * BLOCK_K:
++        split *= 2
++    part = torch.empty((split, M, N), dtype=torch.float32, device=x.device)
++    _skinny_kernel[(nb, split)](x, w, scale if scale is not None else x, part, M, N, K,
++        x.stride(0), w.stride(0), N, BLOCK_M=16, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
++        SPLIT_K=split, IS_INT8=scale is not None, num_warps=4, num_stages=3)
++    return (part[0] if split == 1 else part.sum(0)).to(x.dtype)
++
++def quant_int8_rows(w):
++    s = w.float().abs().amax(1).clamp(min=1e-8) / 127.0
++    q = torch.round(w.float() / s[:, None]).clamp(-127, 127).to(torch.int8)
++    return q, s
++
++
++
++@triton.jit
++def _block_topk_kernel(x_ptr, key_ptr, V, stride_x, nblocks,
++                       BLOCK: tl.constexpr, KB: tl.constexpr):
++    """Per (row, BLOCK-logit block): the block's KB largest logits as sortable keys
++    (monotonic float bits << 32 | index)."""
++    row = tl.program_id(0); blk = tl.program_id(1)
++    offs = blk * BLOCK + tl.arange(0, BLOCK)
++    x = tl.load(x_ptr + row * stride_x + offs, mask=offs < V, other=float("-inf"))
++    bits = x.to(tl.int32, bitcast=True)
++    mono = tl.where(bits >= 0, bits, bits ^ 0x7FFFFFFF)
++    key = (mono.to(tl.int64) << 32) | tl.minimum(offs, V - 1).to(tl.int64)
++    top = tl.topk(key, KB)
++    out = key_ptr + (row * nblocks + blk) * KB + tl.arange(0, KB)
++    tl.store(out, top)
++
++
++def compact_top_k_top_p(x, k, p, KB=32, BLOCK=4096):
++    """Same mask as apply_top_k_top_p when every row has 1 <= top_k <= KB."""
++    R, V = x.shape
++    nb = triton.cdiv(V, BLOCK)
++    keys = torch.empty((R, nb * KB), dtype=torch.int64, device=x.device)
++    _block_topk_kernel[(R, nb)](x, keys, V, x.stride(0), nb, BLOCK=BLOCK, KB=KB, num_warps=8)
++    top = torch.topk(keys, KB, dim=-1).values                    # descending
++    idx = (top & 0xFFFFFFFF).to(torch.int64)
++    vals = x.gather(1, idx)
++    keep = torch.arange(KB, device=x.device)[None, :] < k[:, None].to(torch.int64)
++    vals = vals.masked_fill(~keep, float("-inf"))
++    if p is not None:
++        asc = vals.flip(-1)
++        cum = asc.softmax(-1).cumsum(-1)
++        m = cum <= (1 - p[:, None]); m[:, -1] = False
++        vals = asc.masked_fill(m, float("-inf")).flip(-1)
++    out = torch.full_like(x, float("-inf"))
++    return out.scatter_(1, idx, vals)
+Binary files a/vllm/models/qwen4_exp/nvidia/__pycache__/mtp.cpython-312.pyc and b/vllm/models/qwen4_exp/nvidia/__pycache__/mtp.cpython-312.pyc differ
+Binary files a/vllm/v1/worker/gpu/spec_decode/__pycache__/rejection_sampler.cpython-312.pyc and b/vllm/v1/worker/gpu/spec_decode/__pycache__/rejection_sampler.cpython-312.pyc differ
+diff -ruN a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py	2026-10-29 18:51:31.254516852 +0700
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py	2026-10-29 18:52:12.091492170 +0700
+@@ -48,6 +48,10 @@
+ _FP32_BYTES = 4
+ 
+ 
++# local-53: VLLM_COMPACT_TOPK=1 -> compact top-k/top-p in the recorded verify.
++_COMPACT_TOPK = __import__("os").environ.get("VLLM_COMPACT_TOPK", "0").strip() == "1"
++
++
+ def get_max_chunk_logits(vocab_size: int) -> int:
+     """Largest number of logits rows one verification chunk may hold."""
+     return max(1, MAX_CHUNK_BYTES // (vocab_size * _FP32_BYTES))
+@@ -325,7 +329,15 @@
+         do_top_k = bool(np.any(top_k != ss.vocab_size))
+         do_top_p = bool(np.any(top_p != 1.0))
+         topp_only = bool(do_top_p and np.any((top_k >= self.vocab) & (top_p < 1.0)))
+-        return (n, True, do_temp, do_min_p, do_top_k, do_top_p, topp_only)
++        # local-53: every row with 1 <= top_k <= 32 -> per-block top-32 candidates.
++        compact = bool(
++            _COMPACT_TOPK
++            and do_top_k
++            and not topp_only
++            and int(top_k.max()) <= 32
++            and int(top_k.min()) >= 1
++        )
++        return (n, True, do_temp, do_min_p, do_top_k, do_top_p, topp_only, compact)
+ 
+     def _refresh_tables(self) -> None:
+         if self.tab_version == self.version:
+@@ -359,13 +371,23 @@
+         )
+         x = self.logits_s[:nl]
+         if key[1]:
+-            _, _, do_temp, do_min_p, do_top_k, do_top_p, topp_only = key
++            _, _, do_temp, do_min_p, do_top_k, do_top_p, topp_only, compact = key
+             x = torch.empty_like(x, dtype=torch.float32).copy_(x)
+             if do_temp:
+                 apply_temperature(x, exp_idx, tab["temperature"])
+             if do_min_p:
+                 apply_min_p(x, exp_idx, tab["min_p"])
+-            if do_top_k or do_top_p:
++            if compact:
++                from vllm.models.qwen4_exp.nvidia.ops.skinny import (
++                    compact_top_k_top_p,
++                )
++
++                x = compact_top_k_top_p(
++                    x,
++                    tab["top_k"][exp_idx],
++                    tab["top_p"][exp_idx] if do_top_p else None,
++                )
++            elif do_top_k or do_top_p:
+                 x = apply_top_k_top_p(
+                     x,
+                     tab["top_k"][exp_idx] if do_top_k else None,

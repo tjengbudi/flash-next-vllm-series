@@ -1,0 +1,71 @@
+diff -ruN a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+--- a/vllm/v1/worker/gpu_worker.py	2026-10-29 11:00:09.113608890 +0700
++++ b/vllm/v1/worker/gpu_worker.py	2026-10-29 11:00:09.115608889 +0700
+@@ -861,6 +861,58 @@
+             self.model_runner._init_kv_zero_meta()
+ 
+     @instrument(span_name="Warmup (GPU)")
++    def _warm_linear_kernel_modules(self) -> None:
++        """local-52: VLLM_EXTRA_WARMUP_SIZES="1024,512,...,1".
++
++        Runs every linear layer of this rank once per listed token count on zero
++        inputs, right after the KV cache is allocated. Mixed-precision GEMM
++        libraries (humming) pick a kernel per token-count bucket and load its
++        module on first use; loaded mid-serving on a card whose cache allocator
++        holds the rest of the memory, cuModuleLoadData failed with
++        CUDA_ERROR_OUT_OF_MEMORY (GPU 1, 2026-10-29). Only linear layers run, so
++        no attention, GDN or speculative-decode state is touched.
++        """
++        import os as _os
++        import time as _time
++
++        extra = _os.environ.get("VLLM_EXTRA_WARMUP_SIZES", "").strip()
++        if not extra:
++            return
++        from vllm.model_executor.layers.linear import LinearBase
++
++        max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
++        sizes = sorted(
++            {int(x) for x in extra.split(",") if x.strip() and 0 < int(x) <= max_tokens},
++            reverse=True,
++        )
++        layers = [
++            m for m in self.model_runner.get_model().modules() if isinstance(m, LinearBase)
++        ]
++        dtype = self.model_config.dtype
++        start = _time.perf_counter()
++        calls = failed = 0
++        with torch.inference_mode():
++            for layer in layers:
++                width = getattr(layer, "input_size_per_partition", None) or layer.input_size
++                for size in sizes:
++                    try:
++                        layer(torch.zeros(size, width, dtype=dtype, device=self.device))
++                        calls += 1
++                    except Exception as err:  # warmup only: never block startup
++                        failed += 1
++                        if failed == 1:
++                            logger.warning(
++                                "local-52 warmup: %s(%d) failed: %r",
++                                type(layer).__name__, width, err,
++                            )
++                        break
++        torch.accelerator.synchronize()
++        logger.info(
++            "local-52 warmup: %d linear layers x %d token counts = %d calls in %.1f s "
++            "(%d layers skipped)",
++            len(layers), len(sizes), calls, _time.perf_counter() - start, failed,
++        )
++
+     def compile_or_warm_up_model(self) -> CompilationTimes:
+         warmup_sizes: list[int] = []
+ 
+@@ -901,6 +953,8 @@
+             )
+         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
+ 
++        self._warm_linear_kernel_modules()
++
+         # Warmup and tune the kernels used during model execution before
+         # cuda graph capture.
+         kernel_warmup(self)

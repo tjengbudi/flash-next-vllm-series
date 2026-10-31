@@ -1,0 +1,123 @@
+If you would like to merge this patch upstream, I would appreciate it if you could keep me credited as the commit author, or add the following trailer to the commit message: 
+
+Co-authored-by: Minachist <84688797+aiueonicked@users.noreply.github.com>
+
+diff -ruN base/vllm/models/qwen4_exp/nvidia/mtp.py mtp/vllm/models/qwen4_exp/nvidia/mtp.py
+diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
+index af3bcd4..a07180b 100644
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -181,11 +181,21 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+         self.hidden_size = config.hidden_size
+         self.hc_count = config.hc_count
+ 
+-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, self.hidden_size)
+         draft_vllm_config = _make_draft_vllm_config(
+             vllm_config,
+             self.mtp_start_layer_idx,
+         )
++        # Under PP > 1 the drafter always keeps an input embedding of its own.
++        # The target's copy sits on the first rank, and maybe_share_target_embed
++        # in v1/worker/gpu/spec_decode/eagle/utils.py returns early instead of
++        # sharing across ranks. Build it with the checkpoint's quantization, or
++        # a quantized embed_tokens cannot be loaded into it at all.
++        self.embed_tokens = VocabParallelEmbedding(
++            self.vocab_size,
++            self.hidden_size,
++            quant_config=draft_vllm_config.quant_config,
++            prefix=maybe_prefix(prefix, "embed_tokens"),
++        )
+         with set_current_vllm_config(draft_vllm_config, prefix=prefix):
+             # residual_linear_shared fusion: fc_embedding projects the token
+             # embedding, fc_hidden (shared across HC branches) projects the
+@@ -286,8 +296,13 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+         hidden_size = self.hidden_size
+         prev_block_output: torch.Tensor | None = None
+ 
+-        if get_pp_group().is_first_rank:
+-            assert hidden_states is not None
++        # The drafter exists on the last PP rank only, and the speculator hands
++        # it the target's hidden states directly. Branching on the global PP
++        # rank therefore sends every PP > 1 run down the intermediate-tensors
++        # path, which the speculator never fills, and the assert below fires.
++        # The draft is never split across ranks, so the problem is
++        # whether a caller supplied hidden states.
++        if hidden_states is not None:
+             if inputs_embeds is None:
+                 assert input_ids is not None
+                 inputs_embeds = self.embed_input_ids(input_ids)
+@@ -395,9 +410,14 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+             if config.tie_word_embeddings:
+                 self.lm_head = self.model.embed_tokens
+             else:
++                # Quantized like the target's head, because checkpoint holds
++                # that. It is replaced by the target's own head
++                # right after loading (maybe_share_target_lm_head), so this
++                # copy only need to survive the load.
+                 self.lm_head = ParallelLMHead(
+                     config.vocab_size,
+                     config.hidden_size,
++                    quant_config=self.quant_config,
+                     prefix=maybe_prefix(prefix, "lm_head"),
+                 )
+         else:
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index 82de5c4..e95ba6c 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -631,13 +631,31 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+             kind in ("full_attention", "qwen_sparse_attention")
+             for kind in config.layer_types
+         )
++        if vllm_config.speculative_config is not None:
++            # The MTP drafter carries full-attention layers of its own (mtp.py
++            # builds every draft layer as "full_attention"), and each of them
++            # binds a host pool through bind_kv_cache below. layer_types
++            # describes the target, so the RAM estimate has to add them here or
++            # it under-counts the pool it is about to allocate.
++            self._qsa_offload_layers += max(
++                1, int(getattr(config, "mtp_num_hidden_layers", 1) or 1)
++            )
+         if self._qsa_kv_offload:
+-            if vllm_config.speculative_config is not None:
+-                raise NotImplementedError(
+-                    "QSA host KV currently requires no speculation"
+-                )
+             if vllm_config.parallel_config.tensor_parallel_size != 1:
+                 raise NotImplementedError("QSA host KV currently requires TP=1")
++            if vllm_config.num_speculative_tokens > 1:
++                from vllm.logger import init_logger
++
++                # The verify step runs 1 + num_speculative_tokens query rows
++                # per request and every row selects its own budget of tokens,
++                # so the per-step host read grows with the draft width. Width 1
++                # is the only one that has been exercised against host K/V.
++                init_logger(__name__).warning(
++                    "QSA host KV with num_speculative_tokens=%d: the verify "
++                    "step reads %dx the decode step's K/V over PCIe.",
++                    vllm_config.num_speculative_tokens,
++                    1 + vllm_config.num_speculative_tokens,
++                )
+         self._qsa_stage_min_rows = _QSA_STAGE_MIN_ROWS
+         # 0 turns staging off, and every prefill row then reads host K/V
+         # directly (about 4x slower prefill at long context).
+diff --git a/vllm/platforms/interface.py b/vllm/platforms/interface.py
+index 28991a8..710ee61 100644
+--- a/vllm/platforms/interface.py
++++ b/vllm/platforms/interface.py
+@@ -98,6 +98,15 @@ def _qsa_offload_block_size(vllm_config: "VllmConfig", mamba_page_size: int):
+         return None
+     pp_size = vllm_config.parallel_config.pipeline_parallel_size
+     layers_per_rank = max(1, full_attention // pp_size)
++    if vllm_config.speculative_config is not None:
++        # The MTP drafter is built on the last PP rank only, and its draft
++        # layers are full_attention, so that rank's QSA group is wider than the
++        # others. block_size is global: size it for the widest rank, or that
++        # group's page passes the mamba page and every block in the shared pool
++        # grows to match it.
++        layers_per_rank += max(
++            1, int(getattr(text_config, "mtp_num_hidden_layers", 1) or 1)
++        )
+     per_token = layers_per_rank * _qsa_offload_bytes_per_token_per_layer(vllm_config)
+     block_size = (mamba_page_size // per_token) // 16 * 16
+     return block_size if block_size >= 16 else None

@@ -1,0 +1,28 @@
+diff -ruN a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+--- a/vllm/model_executor/layers/linear.py	2026-10-29 20:54:40.716322126 +0700
++++ b/vllm/model_executor/layers/linear.py	2026-10-29 20:54:40.996321747 +0700
+@@ -170,6 +170,15 @@
+ # set by the Qwen4Exp MTP drafter under VLLM_MTP_INT8_DENSE=1) uses that copy;
+ # VLLM_SKINNY_BF16=1 sends the other bf16 weights through the bf16 kernel.
+ _SKINNY_BF16 = os.environ.get("VLLM_SKINNY_BF16", "0").strip() == "1"
++# local-55: layer classes kept on the normal GEMM even with VLLM_SKINNY_BF16=1.
++# GateLinear = MoE routers: no speed gain there (512 x 2560 already runs at
++# bandwidth in cuBLAS), and a 1-ulp difference in a router logit can swap
++# near-tied experts, so they stay on exactly the pre-local-53 arithmetic.
++_SKINNY_SKIP = frozenset(
++    x.strip()
++    for x in os.environ.get("VLLM_SKINNY_SKIP", "GateLinear").split(",")
++    if x.strip()
++)
+ 
+ 
+ def _skinny_apply(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor | None:
+@@ -177,6 +186,7 @@
+     w = layer.weight
+     if q is None and not (
+         _SKINNY_BF16
++        and type(layer).__name__ not in _SKINNY_SKIP
+         and w.dtype == torch.bfloat16
+         and w.dim() == 2
+         and w.stride(1) == 1
+Binary files a/vllm/model_executor/layers/__pycache__/linear.cpython-312.pyc and b/vllm/model_executor/layers/__pycache__/linear.cpython-312.pyc differ

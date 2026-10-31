@@ -1,0 +1,445 @@
+diff -ru a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+--- a/vllm/v1/worker/gpu/model_runner.py	2026-10-23 18:26:10.610420630 +0700
++++ b/vllm/v1/worker/gpu/model_runner.py	2026-10-23 18:27:41.081255737 +0700
+@@ -158,6 +158,7 @@
+     verify_supports_aux_hidden_states_over_pp,
+ )
+ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
++    _FAST_SAMPLE,
+     RejectionSampler,
+     get_max_chunk_logits,
+ )
+@@ -1655,7 +1656,23 @@
+             logits = all_to_all_logits(local_logits, shard_metadata)
+             logits = logits[:, : self.vocab_size]
+         else:
+-            sample_hidden_states = hidden_states[input_batch.logits_indices]
++            nl = input_batch.logits_indices.shape[0]
++            if (
++                _FAST_SAMPLE
++                and self.pcp_manager is None
++                and self.adaptive_verification is None
++                and input_batch.num_draft_tokens > 0
++                and input_batch.num_tokens == nl
++                and nl == input_batch.num_reqs * self.decode_query_len
++                and input_batch.num_draft_tokens
++                == input_batch.num_reqs * (self.decode_query_len - 1)
++            ):
++                # local-37: every request is a full spec decode (1 + drafts
++                # scheduled tokens, all of them logits), so logits_indices is
++                # arange(num_tokens): slice instead of a gather launch.
++                sample_hidden_states = hidden_states[:nl]
++            else:
++                sample_hidden_states = hidden_states[input_batch.logits_indices]
+             logits = self.model.compute_logits(sample_hidden_states)
+ 
+         # A diffusion prefill has no logit rows even when a bitmask row
+Only in b/vllm/v1/worker/gpu: __pycache__
+Only in b/vllm/v1/worker/gpu/spec_decode: __pycache__
+diff -ru a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py	2026-10-23 18:26:10.608420634 +0700
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py	2026-10-23 18:43:12.992021880 +0700
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from collections.abc import Iterable, Iterator
+ from typing import Any
+ 
+@@ -8,6 +9,7 @@
+ 
+ from vllm.config import SpeculativeConfig
+ from vllm.config.model import PROCESSED_LOGPROBS_MODES
++from vllm.logger import init_logger
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.outputs import LogprobsTensors
+ from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
+@@ -25,6 +27,18 @@
+     rejection_sample,
+ )
+ 
++# local-37 (VLLM_FAST_SAMPLE=1): a decode verify step whose requests all carry
++# num_speculative_tokens drafts replays a CUDA graph of the whole verify
++# (draft gather, sampling params, rejection kernels, num_sampled/num_rejected),
++# recorded per (num_reqs, sampling-param shape) on the second sight of that
++# shape, instead of ~20 Python-launched kernels. It runs the same kernels on the
++# same values (per-request seeds + positions drive the RNG), so outputs are
++# bitwise identical. Off (0, the default here) = the l36 code path.
++_FAST_SAMPLE = os.environ.get("VLLM_FAST_SAMPLE", "0") == "1"
++_FS_MAX_GRAPHS = 64
++
++logger = init_logger(__name__)
++
+ # Cap on the FP32 target-logits buffer materialized by apply_sampling_params.
+ # TODO(mgoin): Chunking is a workaround. The rejection kernels already upcast
+ # per vocab block on load and apply ops like temperature and gumbel, so folding
+@@ -144,6 +158,327 @@
+     return draft_sampled, pos
+ 
+ 
++class _FastVerify:
++    """local-37: recorded CUDA graphs of the decode verify step.
++
++    Every input the graph reads sits at a fixed address: the logits and
++    idx_mapping are copied into static buffers each step; the per-request
++    sampling tables (UVA, re-pointed on every staged write) are mirrored into
++    device tables after any add_request wrote them; input_ids / positions /
++    seq_lens are the model runner's persistent buffers (checked by pointer).
++    """
++
++    _TABLES = ("temperature", "seeds", "top_k", "top_p", "min_p")
++
++    def __init__(self, rs: "RejectionSampler", logits: torch.Tensor):
++        sampler = rs.sampler
++        self.rs = rs
++        self.sampler = sampler
++        ss = sampler.sampling_states
++        self.ss = ss
++        self.max_reqs = ss.max_num_reqs
++        self.nspec = rs.num_speculative_steps
++        self.q = self.nspec + 1
++        self.vocab = logits.shape[1]
++        self.dtype = logits.dtype
++        dev = logits.device
++        self.device = dev
++        m = self.max_reqs * self.q
++        self.logits_s = torch.zeros(m, self.vocab, dtype=self.dtype, device=dev)
++        self.idx_s = torch.zeros(self.max_reqs, dtype=torch.int32, device=dev)
++        # Per-n destination views of the per-step input copies (slicing costs
++        # host time too).
++        self.in_views = [
++            [self.logits_s[: n * self.q], self.idx_s[:n]]
++            for n in range(self.max_reqs + 1)
++        ]
++        ar = torch.arange(m, dtype=torch.int64, device=dev)
++        self.rep_c = ar // self.q
++        self.lidx_c = ar.clone()
++        self.lpos_c = (ar % self.q).to(torch.int32)
++        self.cu_c = (
++            torch.arange(self.max_reqs + 1, dtype=torch.int32, device=dev) * self.q
++        )
++        self.uva = {name: getattr(ss, name) for name in self._TABLES}
++        self.uva["prefill_len"] = sampler.req_states.prefill_len
++        self.tab = {
++            name: torch.zeros_like(t.gpu, device=dev) for name, t in self.uva.items()
++        }
++        # Every writer of these tables (and of the per-request flags the key
++        # reads) runs inside SamplingStates/RequestState.add_request: count
++        # those calls, and refresh the device mirrors / drop cached keys when
++        # the count moved.
++        self.version = 0
++        self.tab_version = -1
++        self.key_cache: dict[bytes, tuple] = {}
++        self.key_version = -1
++
++        def bump(fn):
++            def wrapped(*args, **kwargs):
++                self.version += 1
++                return fn(*args, **kwargs)
++
++            return wrapped
++
++        ss.add_request = bump(ss.add_request)
++        sampler.req_states.add_request = bump(sampler.req_states.add_request)
++        self.ptrs: tuple[int, int, int] | None = None
++        self.bufs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
++        self.graphs: dict[tuple, tuple[torch.cuda.CUDAGraph, tuple]] = {}
++        self.seen: dict[tuple, int] = {}
++        self.bad: set[tuple] = set()
++        self.keep: list[Any] = []
++        self.pool = torch.cuda.graph_pool_handle()
++        self.stream = torch.cuda.Stream(device=dev)
++        lps = sampler.logits_processors
++        self.logit_bias, self.penalties, self.bad_words = lps[0], lps[1], lps[2]
++        self.stats = {"replays": 0, "eager": 0, "captures": 0, "bad": 0}
++        rs._fs_stats = self.stats
++
++    @staticmethod
++    def supported(rs: "RejectionSampler", logits: torch.Tensor) -> bool:
++        from vllm.platforms import current_platform
++        from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
++        from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
++        from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
++
++        sampler = rs.sampler
++        lps = getattr(sampler, "logits_processors", ())
++        return (
++            current_platform.is_cuda()
++            and type(sampler) is Sampler
++            and rs.watermark_key is None
++            and rs.synthetic_conditional_rates is None
++            and not rs.use_block_verification
++            and not rs.enable_adaptive_verification
++            and not sampler.compute_nans
++            and rs.num_speculative_steps > 0
++            and logits.ndim == 2
++            and len(lps) == 3
++            and isinstance(lps[0], LogitBiasState)
++            and isinstance(lps[1], PenaltiesState)
++            and isinstance(lps[2], BadWordsState)
++        )
++
++    def _key(
++        self, logits: torch.Tensor, ib: InputBatch, draft_logits: torch.Tensor | None
++    ) -> tuple | None:
++        n = ib.num_reqs
++        nl = n * self.q
++        if (
++            draft_logits is not None
++            or n <= 0
++            or n > self.max_reqs
++            or ib.num_tokens != nl
++            or ib.num_draft_tokens != n * self.nspec
++            or logits.shape[0] != nl
++            or logits.shape[1] != self.vocab
++            or logits.dtype != self.dtype
++            or ib.idx_mapping.shape[0] != n
++        ):
++            return None
++        ptrs = (
++            ib.input_ids.data_ptr(),
++            ib.positions.data_ptr(),
++            ib.seq_lens.data_ptr(),
++        )
++        if self.ptrs is None:
++            self.ptrs = ptrs
++            self.bufs = (ib.input_ids, ib.positions, ib.seq_lens)
++        elif ptrs != self.ptrs:
++            return None
++        idx_np = ib.idx_mapping_np
++        if self.key_version != self.version:
++            self.key_cache.clear()
++            self.key_version = self.version
++        cache_key = idx_np.tobytes()
++        key = self.key_cache.get(cache_key, False)
++        if key is False:
++            key = self._sampling_key(n, idx_np)
++            self.key_cache[cache_key] = key
++        return key
++
++    def _sampling_key(self, n: int, idx_np: np.ndarray) -> tuple | None:
++        ss = self.ss
++        if int(np.max(ss.num_logprobs[idx_np])) != NO_LOGPROBS:
++            return None
++        if not np.any(self.sampler.needs_logits_processing[idx_np]):
++            return (n, False)
++        # Mirror apply_sampling_params: the logits processors must all skip.
++        tb = self.sampler.thinking_budget_state
++        if (
++            np.any(self.logit_bias.use_logit_bias[idx_np])
++            or np.any(self.penalties.use_penalty[idx_np])
++            or int(self.bad_words.num_bad_words.np[idx_np].max()) != 0
++            or (tb.enabled and np.any(tb.use_thinking_budget[idx_np]))
++        ):
++            return None
++        temp = ss.temperature.np[idx_np]
++        do_temp = not bool(np.all((temp == 0.0) | (temp == 1.0)))
++        do_min_p = not bool(np.all(ss.min_p.np[idx_np] == 0.0))
++        top_k = ss.top_k.np[idx_np]
++        top_p = ss.top_p.np[idx_np]
++        do_top_k = bool(np.any(top_k != ss.vocab_size))
++        do_top_p = bool(np.any(top_p != 1.0))
++        topp_only = bool(do_top_p and np.any((top_k >= self.vocab) & (top_p < 1.0)))
++        return (n, True, do_temp, do_min_p, do_top_k, do_top_p, topp_only)
++
++    def _refresh_tables(self) -> None:
++        if self.tab_version == self.version:
++            return
++        for name, t in self.uva.items():
++            g = t.gpu
++            self.tab[name][: g.shape[0]].copy_(g, non_blocking=True)
++        self.tab_version = self.version
++
++    def _body(self, key: tuple) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
++        from vllm.v1.worker.gpu.sample.min_p import apply_min_p
++        from vllm.v1.worker.gpu.sample.sampler import apply_top_k_top_p
++
++        assert self.bufs is not None
++        input_ids, positions, seq_lens = self.bufs
++        n = key[0]
++        nl = n * self.q
++        tab = self.tab
++        idx = self.idx_s[:n]
++        exp_idx = self.idx_s[self.rep_c[:nl]]
++        lpos = self.lpos_c[:nl]
++        cu = self.cu_c[: n + 1]
++        draft_sampled, pos = gather_draft_sampled(
++            input_ids,
++            positions,
++            self.lidx_c[:nl],
++            exp_idx,
++            lpos,
++            tab["prefill_len"],
++        )
++        x = self.logits_s[:nl]
++        if key[1]:
++            _, _, do_temp, do_min_p, do_top_k, do_top_p, topp_only = key
++            x = torch.empty_like(x, dtype=torch.float32).copy_(x)
++            if do_temp:
++                apply_temperature(x, exp_idx, tab["temperature"])
++            if do_min_p:
++                apply_min_p(x, exp_idx, tab["min_p"])
++            if do_top_k or do_top_p:
++                x = apply_top_k_top_p(
++                    x,
++                    tab["top_k"][exp_idx] if do_top_k else None,
++                    tab["top_p"][exp_idx] if do_top_p else None,
++                    has_topp_only_rows=topp_only,
++                )
++        sampled, num_sampled = rejection_sample(
++            x,
++            None,
++            draft_sampled,
++            cu,
++            pos,
++            idx,
++            exp_idx,
++            lpos,
++            tab["temperature"],
++            tab["seeds"],
++            self.nspec,
++            None,
++            use_fp64=self.sampler.use_fp64_gumbel,
++            use_block_verification=False,
++        )
++        num_sampled, num_rejected = get_num_sampled_and_rejected(
++            num_sampled, seq_lens, cu, idx, tab["prefill_len"]
++        )
++        return sampled, num_sampled, num_rejected
++
++    def _capture(self, key: tuple) -> tuple[torch.cuda.CUDAGraph, tuple]:
++        from vllm.v1.sample.ops import topk_topp_triton as tt
++
++        # Workspaces cached by the top-k/top-p kernels: the graph bakes their
++        # addresses, so keep them alive even if a cache entry is replaced.
++        for cache in ("_TRITON_BUFFER_CACHE", "_TRITON_TABLE_CACHE", "_TRITON_SPLIT_CACHE"):
++            c = getattr(tt, cache, None)
++            if c:
++                self.keep.append(list(c.values()))
++        graph = torch.cuda.CUDAGraph()
++        cur = torch.cuda.current_stream()
++        self.stream.wait_stream(cur)
++        with torch.cuda.stream(self.stream):
++            graph.capture_begin(pool=self.pool, capture_error_mode="thread_local")
++            try:
++                outs = self._body(key)
++            finally:
++                graph.capture_end()
++        cur.wait_stream(self.stream)
++        return graph, outs
++
++    def __call__(
++        self, logits: torch.Tensor, ib: InputBatch, draft_logits: torch.Tensor | None
++    ) -> SamplerOutput | None:
++        key = self._key(logits, ib, draft_logits)
++        if key is None or key in self.bad:
++            self.stats["eager"] += 1
++            return None
++        entry = self.graphs.get(key)
++        check = False
++        if entry is None:
++            seen = self.seen.get(key, 0) + 1
++            self.seen[key] = seen
++            if seen < 2 or len(self.graphs) >= _FS_MAX_GRAPHS:
++                # First sight: the eager step compiles the kernels and sizes
++                # the top-k/top-p workspaces outside any capture.
++                self.stats["eager"] += 1
++                return None
++            try:
++                entry = self._capture(key)
++            except Exception as e:  # keep serving eagerly
++                logger.warning("local-37: recording verify %s failed: %r", key, e)
++                self.bad.add(key)
++                self.stats["bad"] += 1
++                return None
++            self.graphs[key] = entry
++            self.stats["captures"] += 1
++            check = True
++        self._refresh_tables()
++        torch._foreach_copy_(self.in_views[key[0]], [logits, ib.idx_mapping])
++        graph, (sampled, num_sampled, num_rejected) = entry
++        graph.replay()
++        out = SamplerOutput(
++            sampled_token_ids=sampled.clone(),
++            logprobs_tensors=None,
++            num_nans=None,
++            num_sampled=num_sampled.clone(),
++            num_rejected=num_rejected.clone(),
++        )
++        if check:
++            # One-time self-check of a new recording against the eager path.
++            ref = self.rs._eager_call(logits, ib, draft_logits)
++            # Slots past num_sampled are never written (uninitialized).
++            valid = (
++                torch.arange(self.q, device=self.device)[None, :]
++                < ref.num_sampled[:, None]
++            )
++            same = (
++                torch.equal(ref.num_sampled, out.num_sampled)
++                and torch.equal(ref.num_rejected, out.num_rejected)
++                and torch.equal(
++                    ref.sampled_token_ids[valid], out.sampled_token_ids[valid]
++                )
++            )
++            if not same:
++                logger.warning(
++                    "local-37: recorded verify %s differs from eager; disabled", key
++                )
++                # Keep it alive: freeing a graph can release the shared pool.
++                self.keep.append(self.graphs.pop(key))
++                self.bad.add(key)
++                self.stats["bad"] += 1
++                return ref
++            logger.info("local-37: recorded decode verify %s", key)
++        self.stats["replays"] += 1
++        if (self.stats["replays"] & 0x3FFF) == 0:
++            logger.info("local-37: verify stats %s", self.stats)
++        return out
++
++
+ class RejectionSampler:
+     def __init__(
+         self,
+@@ -173,6 +508,9 @@
+             )
+         elif rejection_sample_method == "block":
+             self.use_block_verification = True
++        # local-37: recorded decode verify (None = not built yet, False = off).
++        self._fs: _FastVerify | bool | None = None
++        self._fs_stats: dict[str, int] | None = None
+ 
+     def _get_logprobs_tensors(
+         self,
+@@ -360,6 +698,31 @@
+         self,
+         logits: torch.Tensor,
+         input_batch: InputBatch,
++        draft_logits: torch.Tensor | None = None,
++    ) -> SamplerOutput:
++        if _FAST_SAMPLE and self._fs is not False:
++            if self._fs is None:
++                self._fs = (
++                    _FastVerify(self, logits)
++                    if _FastVerify.supported(self, logits)
++                    else False
++                )
++                if self._fs is False:
++                    logger.warning(
++                        "local-37: VLLM_FAST_SAMPLE=1 ignored for this config "
++                        "(needs CUDA, the stock sampler, no watermark / synthetic "
++                        "/ block / adaptive verification, no NaN counting)"
++                    )
++            if self._fs is not False:
++                out = self._fs(logits, input_batch, draft_logits)
++                if out is not None:
++                    return out
++        return self._eager_call(logits, input_batch, draft_logits)
++
++    def _eager_call(
++        self,
++        logits: torch.Tensor,
++        input_batch: InputBatch,
+         draft_logits: torch.Tensor | None = None,
+     ) -> SamplerOutput:
+         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear

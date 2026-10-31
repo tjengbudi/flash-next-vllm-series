@@ -1,0 +1,163 @@
+local-06 (budi, 2026-10-12): Marlin MoE repack without full-size temporaries.
+
+vLLM 0.31.0 loads compressed-tensors MoE weights N-first and converts them in
+_process_weights_marlin: it transposes w13 and w2 to contiguous K-first copies,
+keeps both alive, then repacks. On top of the loaded weights a layer briefly
+holds two full copies plus the repacked output. 0.30.0 loaded the weights
+K-first and only needed the repack output. Qwen3.8-Flash-Next on 3 x 3090 fills
+each card almost completely with weights, so the 0.31 build died at load:
+torch.OutOfMemoryError in gptq_marlin_moe_repack (400 MiB, 5 MiB free) on PP0
+and PP1.
+
+This repacks 64 experts at a time (Marlin repacks each expert on its own, so
+the result is unchanged) and, when an expert's repacked size equals its loaded
+size, writes each chunk back over the loaded weights it was read from, so no
+full-size output buffer is needed. Checked on an RTX 3060 with the model's MoE
+shapes (512 experts, N 640, group 128): outputs identical to the one-shot path;
+extra peak per layer 1980 MiB -> 192 MiB (a separate output buffer, rev 1:
+1071 MiB, still OOMed the MTP build on PP1).
+Drop once upstream stops materialising the transposed copies.
+
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
+index 239fe1d..930922e 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
+@@ -572,6 +572,63 @@ def _pad_w13_bias(bias: torch.Tensor, n: int, padded_n: int) -> torch.Tensor:
+     return bias.reshape(e, 2 * padded_n).contiguous()
+ 
+ 
++# local-06 (flash-next): experts per repack chunk. The temporaries of one chunk
++# are 1/(num_experts/chunk) of a layer's expert weights.
++_MARLIN_REPACK_CHUNK = 64
++
++
++def _marlin_repack_chunked(
++    qweight_nfirst: torch.Tensor,
++    prepare,
++    num_bits: int,
++    pack_factor: int,
++    is_a_8bit: bool,
++) -> torch.Tensor:
++    """N-first ``[E, N, K_packed]`` -> Marlin layout, a chunk of experts at a time.
++
++    The one-shot path transposes w13 and w2 to K-first copies, keeps both alive
++    and then repacks, so on top of the loaded weights a layer briefly holds two
++    full copies plus the repacked output. On a card filled to the brim by the
++    weights (3 x 24 GiB running Qwen3.8-Flash-Next) that is an OOM at load time.
++    Repacking per chunk into a preallocated output keeps the extra memory at the
++    output plus one chunk. Marlin repacks every expert on its own, so the result
++    is the same.
++
++    When an expert's repacked bytes equal its loaded bytes (no padding, no FP8
++    preprocessing), each chunk is written back over the loaded weights it was
++    read from: the chunk is copied out before it is overwritten, and expert e
++    occupies the same byte range in both layouts. The result is then a view of
++    the loaded storage and the extra memory is two chunks, below 0.30's peak.
++    """
++    num_experts = qweight_nfirst.shape[0]
++    source = qweight_nfirst.data
++    out = None
++    for start in range(0, num_experts, _MARLIN_REPACK_CHUNK):
++        end = min(start + _MARLIN_REPACK_CHUNK, num_experts)
++        chunk = prepare(source[start:end].transpose(1, 2).contiguous())
++        packed = ops.gptq_marlin_moe_repack(
++            chunk,
++            chunk.shape[1] * pack_factor,
++            chunk.shape[2],
++            num_bits,
++            is_a_8bit=is_a_8bit,
++        )
++        del chunk
++        if out is None:
++            in_place = (
++                source.is_contiguous()
++                and packed.dtype == source.dtype
++                and packed[0].numel() == source[0].numel()
++            )
++            if in_place:
++                out = source.view(-1).view(num_experts, *packed.shape[1:])
++            else:
++                out = packed.new_empty((num_experts, *packed.shape[1:]))
++        out[start:end].copy_(packed)
++        del packed
++    return out
++
++
+ def _process_weights_marlin(
+     layer: torch.nn.Module,
+     input_dtype: torch.dtype | None,
+@@ -611,9 +668,8 @@ def _process_weights_marlin(
+     4. Permute scales (and optionally extract INT8 global scales).
+     5. Permute bias tensors.
+     """
+-    # Canonical N-first → K-first for Marlin.
+-    w13_qweight = w13_qweight.transpose(1, 2).contiguous()
+-    w2_qweight = w2_qweight.transpose(1, 2).contiguous()
++    # Canonical N-first → K-first for Marlin. The packed weights are transposed
++    # chunk by chunk inside _marlin_repack_chunked (local-06).
+     w13_scales = w13_scales.transpose(1, 2).contiguous()
+     w2_scales = w2_scales.transpose(1, 2).contiguous()
+     if w13_qzeros is not None:
+@@ -633,15 +689,12 @@ def _process_weights_marlin(
+     w2_bias_out: torch.Tensor | None = None
+ 
+     # --- FP8 weight / scale adjustment ---
+-    if input_dtype == torch.float8_e4m3fn:
++    is_fp8_input = input_dtype == torch.float8_e4m3fn
++    if is_fp8_input:
+         # NOTE: for non-zp quantization format only
+-        marlin_w13_qweight = ops.marlin_int4_fp8_preprocess(w13_qweight, inplace=False)
+-        marlin_w2_qweight = ops.marlin_int4_fp8_preprocess(w2_qweight, inplace=False)
+         marlin_w13_scales = w13_scales.data * 512
+         marlin_w2_scales = w2_scales.data * 512
+     else:
+-        marlin_w13_qweight = w13_qweight
+-        marlin_w2_qweight = w2_qweight
+         marlin_w13_scales = w13_scales
+         marlin_w2_scales = w2_scales
+ 
+@@ -649,9 +702,18 @@ def _process_weights_marlin(
+     # GPTQ packs along K: w13's N is in the (shard) columns, w2's N in the rows.
+     N = layer.intermediate_size_per_partition
+     padded_N = marlin_moe_padded_intermediate(N, group_size)
++
++    def _prepare_w13(w: torch.Tensor) -> torch.Tensor:
++        if is_fp8_input:
++            w = ops.marlin_int4_fp8_preprocess(w, inplace=False)
++        return _pad_w13_shard_cols(w, N, padded_N)
++
++    def _prepare_w2(w: torch.Tensor) -> torch.Tensor:
++        if is_fp8_input:
++            w = ops.marlin_int4_fp8_preprocess(w, inplace=False)
++        return _pad_rows(w, padded_N // pack_factor)
++
+     if padded_N != N:
+-        marlin_w13_qweight = _pad_w13_shard_cols(marlin_w13_qweight, N, padded_N)
+-        marlin_w2_qweight = _pad_rows(marlin_w2_qweight, padded_N // pack_factor)
+         marlin_w13_scales = _pad_w13_shard_cols(marlin_w13_scales, N, padded_N)
+         if group_size > 0:
+             marlin_w2_scales = _pad_rows(marlin_w2_scales, padded_N // group_size)
+@@ -665,19 +727,11 @@ def _process_weights_marlin(
+             w13_bias = _pad_w13_bias(w13_bias, N, padded_N)
+ 
+     # --- Repack weights ---
+-    marlin_w13_qweight = ops.gptq_marlin_moe_repack(
+-        marlin_w13_qweight,
+-        marlin_w13_qweight.shape[1] * pack_factor,
+-        marlin_w13_qweight.shape[2],
+-        num_bits,
+-        is_a_8bit=is_a_8bit,
++    marlin_w13_qweight = _marlin_repack_chunked(
++        w13_qweight, _prepare_w13, num_bits, pack_factor, is_a_8bit
+     )
+-    marlin_w2_qweight = ops.gptq_marlin_moe_repack(
+-        marlin_w2_qweight,
+-        marlin_w2_qweight.shape[1] * pack_factor,
+-        marlin_w2_qweight.shape[2],
+-        num_bits,
+-        is_a_8bit=is_a_8bit,
++    marlin_w2_qweight = _marlin_repack_chunked(
++        w2_qweight, _prepare_w2, num_bits, pack_factor, is_a_8bit
+     )
+ 
+     # --- Permute scales ---

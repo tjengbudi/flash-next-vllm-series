@@ -1,0 +1,472 @@
+# local-02-qsa-fp8-kv, vLLM 0.31.0 version (budi, 2026-10-12): FP8-e4m3 main
+# K/V for QSA on sm_86, on top of upstream #55557.
+#
+# 0.31.0 ships FP8 K/V for QSA (#55557): the backend accepts fp8, the cache is
+# uint8, forward_qsa views it as float8_e4m3fn and the split-K kernel converts
+# it with `.to()`. That conversion needs Triton's fp8e4nv type, which exists
+# only on sm_89+: on a 3090 (and the 3060) the kernel fails to compile
+# (checked 2026-10-12, Triton 3.7.1). Upstream also has no FP8 in the staged
+# prefill and row-cache kernels, which come from the flash-next patches.
+#
+# What this patch does (only with --kv-cache-dtype fp8; BF16 is unchanged):
+#   * Every QSA kernel (split-K, staged prefill, row cache) reads the cache as
+#     uint8 and dequantizes through a 256-entry E4M3 -> BF16 table (exact).
+#     Both dots then run in BF16 (this absorbs the 0.30 build's local-05:
+#     no FP16 converts per tile; prefill kernels ~40% faster on sm_86).
+#   * Scales follow upstream: host floats (layer._k_scale_float/_v_scale_float),
+#     k folded into softmax_scale, v into the output normalizer. The staged and
+#     row-cache kernels take the same runtime softmax_scale/output_scale.
+#   * QSA host-KV offload: pinned pool and GPU slot use the cache dtype, so the
+#     pool halves (2048 -> 1024 B/token/layer), and
+#     _qsa_offload_bytes_per_token_per_layer counts the 1-byte slot.
+#   * The table is created in bind_kv_cache, outside CUDA graph capture.
+# Not needed any more (upstream has it): the backend dtype list,
+# supports_kv_cache_dtype, and building FlashAttentionImpl with "auto".
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index c215fc2..f7f78ca 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -28,6 +28,54 @@ def _is_sm90() -> bool:
+     return current_platform.get_device_capability() == (9, 0)
+ 
+ 
++# FP8-e4m3 main K/V on sm_86 (flash-next local-02). Upstream reads the cache
++# as float8_e4m3fn and converts it in Triton, which needs the fp8e4nv type that
++# Triton only has on sm_89+. Here every QSA kernel reads the cache as uint8 and
++# dequantizes through a 256-entry E4M3 -> BF16 table (exact), and both dots run
++# in BF16 (local-05: no FP16 converts per tile). The per-tensor k/v scales stay
++# host floats folded into softmax_scale / output_scale, as upstream does.
++_QSA_FP8_E4M3_LUT: dict[torch.device, torch.Tensor] = {}
++
++
++def _qsa_fp8_e4m3_lut(device: torch.device) -> torch.Tensor:
++    device = torch.device(device)
++    if device.type == "cuda" and device.index is None:
++        device = torch.device("cuda", torch.cuda.current_device())
++    lut = _QSA_FP8_E4M3_LUT.get(device)
++    if lut is None:
++        lut = (
++            torch.arange(256, dtype=torch.uint8)
++            .view(torch.float8_e4m3fn)
++            .to(torch.bfloat16)
++            .to(device)
++        )
++        _QSA_FP8_E4M3_LUT[device] = lut
++    return lut
++
++
++def qsa_fp8_prepare(device: torch.device) -> None:
++    """Create the per-device table outside CUDA graph capture."""
++    _qsa_fp8_e4m3_lut(device)
++
++
++def _qsa_fp8_bytes(cache: torch.Tensor) -> tuple[torch.Tensor, bool]:
++    """(cache as uint8 if it holds E4M3, whether it does)."""
++    if cache.dtype == torch.float8_e4m3fn:
++        return cache.view(torch.uint8), True
++    return cache, cache.dtype == torch.uint8
++
++
++def _qsa_scales(
++    head_dim: int, is_fp8: bool, k_scale: float | None, v_scale: float | None
++) -> tuple[float, float]:
++    """(softmax_scale with the K scale folded in, output scale = V scale)."""
++    if not is_fp8:
++        return head_dim**-0.5, 1.0
++    k = 1.0 if k_scale is None else float(k_scale)
++    v = 1.0 if v_scale is None else float(v_scale)
++    return (head_dim**-0.5) * k, v
++
++
+ @triton.jit(do_not_specialize=["num_rows", "num_requests"])
+ def _qsa_sparse_paged_gqa_splitk_kernel(
+     q_ptr,
+@@ -41,6 +89,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+     output_ptr,
+     softmax_scale,
+     output_scale,
++    lut_ptr,
+     output_gate_ptr,
+     stride_q_row,
+     stride_q_head,
+@@ -151,9 +200,9 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+             other=0.0,
+         )
+         if IS_FP8:
+-            # e4m3 -> Q dtype is exact; keep the QK dot in Q's dtype (fp8 QK
+-            # measured slower here and less accurate).
+-            keys = keys.to(query.dtype)
++            # E4M3 bytes -> BF16 through the table (exact); see _qsa_fp8_e4m3_lut.
++            keys = tl.load(lut_ptr + keys.to(tl.uint8, bitcast=True).to(tl.int32))
++            values = tl.load(lut_ptr + values.to(tl.uint8, bitcast=True).to(tl.int32))
+         scores = tl.dot(query, keys)
+         # Scaling scores avoids re-quantizing a scaled query to BF16; for fp8
+         # caches the K dequant scale is already folded into softmax_scale on the
+@@ -165,11 +214,6 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+         probabilities = tl.where(
+             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
+         )
+-        if IS_FP8:
+-            # Dequant V to fp16 (not bf16) for the PV dot: P <= 1 (online
+-            # softmax) so fp16 has the range, its wider mantissa is more
+-            # accurate, and the fp8->fp16 upcast with an fp16 PV dot is faster.
+-            values = values.to(tl.float16)
+         accumulator = tl.dot(
+             probabilities.to(values.dtype),
+             values,
+@@ -603,6 +647,9 @@ def _qsa_sparse_staged_gqa_kernel(
+     norm_ptr,
+     output_ptr,
+     output_gate_ptr,
++    softmax_scale,
++    output_scale,
++    lut_ptr,
+     stride_q_row,
+     stride_q_head,
+     stride_k_block,
+@@ -629,6 +676,7 @@ def _qsa_sparse_staged_gqa_kernel(
+     BLOCK_N: tl.constexpr,
+     FIRST_BUCKET: tl.constexpr,
+     LAST_BUCKET: tl.constexpr,
++    IS_FP8: tl.constexpr,
+ ) -> None:
+     local_row = tl.program_id(0)
+     kv_head = tl.program_id(1)
+@@ -664,7 +712,7 @@ def _qsa_sparse_staged_gqa_kernel(
+             other=0.0,
+         )
+ 
+-    softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
++    score_scale = softmax_scale * 1.4426950408889634
+     tile_end = tl.minimum(NUM_TILES, tl.cdiv(tl.minimum(valid_count, TOPK), BLOCK_N))
+ 
+     for tile in range(0, tile_end):
+@@ -700,8 +748,12 @@ def _qsa_sparse_staged_gqa_kernel(
+             mask=valid[:, None],
+             other=0.0,
+         )
++        if IS_FP8:
++            # E4M3 bytes -> BF16 through the table (exact); see _qsa_fp8_e4m3_lut.
++            keys = tl.load(lut_ptr + keys.to(tl.uint8, bitcast=True).to(tl.int32))
++            values = tl.load(lut_ptr + values.to(tl.uint8, bitcast=True).to(tl.int32))
+         scores = tl.dot(query, keys)
+-        scores *= softmax_scale_log2
++        scores *= score_scale
+         scores = tl.where(valid[None, :], scores, -1.0e20)
+         next_max = tl.maximum(max_value, tl.max(scores, axis=1))
+         alpha = tl.math.exp2(max_value - next_max)
+@@ -720,7 +772,7 @@ def _qsa_sparse_staged_gqa_kernel(
+         has_values = normalizer > 0
+         normalized_output = tl.where(
+             has_values[:, None],
+-            accumulator / tl.maximum(normalizer[:, None], 1.0e-20),
++            accumulator * (output_scale / tl.maximum(normalizer[:, None], 1.0e-20)),
+             0.0,
+         )
+         # Same gate epilogue as _qsa_sparse_paged_gqa_splitk_kernel: round the
+@@ -770,6 +822,8 @@ def qsa_sparse_paged_attention_staged(
+     out: torch.Tensor,
+     *,
+     output_gate: torch.Tensor,
++    k_scale: float | None = None,
++    v_scale: float | None = None,
+ ) -> None:
+     """Run the rows in ``rows`` against host-resident K/V via the arena.
+ 
+@@ -791,12 +845,17 @@ def qsa_sparse_paged_attention_staged(
+     num_kv_heads = kv_cache.shape[1]
+     num_pages = max_logical_page + 1
+     num_buckets = triton.cdiv(num_pages, pages_in_arena)
++    assert arena.dtype == kv_cache.dtype
++    kv_cache, is_fp8 = _qsa_fp8_bytes(kv_cache)
++    arena, _ = _qsa_fp8_bytes(arena)
++    softmax_scale, output_scale = _qsa_scales(head_dim, is_fp8, k_scale, v_scale)
++    lut = _qsa_fp8_e4m3_lut(q.device) if is_fp8 else q
+ 
+     group_size = q.shape[1] // num_kv_heads
+     block_m = triton.next_power_of_2(group_size)
+     selection_width = logical_indices.shape[1] - 1
+     block_n, partial_warps, num_tiles, _ = _select_config(
+-        num_rows, num_kv_heads, use_prefill_config, selection_width
++        num_rows, num_kv_heads, use_prefill_config, selection_width, is_fp8
+     )
+ 
+     if num_buckets == 1:
+@@ -828,6 +887,9 @@ def qsa_sparse_paged_attention_staged(
+             norm_state,
+             out,
+             output_gate_view,
++            softmax_scale,
++            output_scale,
++            lut,
+             q.stride(0),
+             q.stride(1),
+             k_arena.stride(0),
+@@ -854,6 +916,7 @@ def qsa_sparse_paged_attention_staged(
+             BLOCK_N=block_n,
+             FIRST_BUCKET=bucket == 0,
+             LAST_BUCKET=bucket == num_buckets - 1,
++            IS_FP8=is_fp8,
+             num_warps=partial_warps,
+             num_stages=2,
+         )
+@@ -947,17 +1010,14 @@ def qsa_sparse_paged_attention(
+     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
+     assert q.dtype == torch.bfloat16
+     assert k_cache.dtype == v_cache.dtype
+-    is_fp8 = k_cache.dtype == torch.float8_e4m3fn
+-    if is_fp8:
+-        assert k_scale is not None and v_scale is not None
+-        # Host pre-multiply: fold the K dequant scale into the attention scale
+-        # and pass V's dequant scale as the kernel's output scale.
+-        softmax_scale = (head_dim**-0.5) * float(k_scale)
+-        output_scale = float(v_scale)
+-    else:
++    k_cache, is_fp8 = _qsa_fp8_bytes(k_cache)
++    v_cache, _ = _qsa_fp8_bytes(v_cache)
++    if not is_fp8:
+         assert k_cache.dtype == torch.bfloat16
+-        softmax_scale = head_dim**-0.5
+-        output_scale = 1.0
++    # Host pre-multiply: fold the K dequant scale into the attention scale and
++    # pass V's dequant scale as the kernel's output scale.
++    softmax_scale, output_scale = _qsa_scales(head_dim, is_fp8, k_scale, v_scale)
++    lut = _qsa_fp8_e4m3_lut(q.device) if is_fp8 else q
+     assert logical_indices.dtype == block_table.dtype == torch.int32
+     assert token_to_req.dtype == torch.int32
+     assert q.device == k_cache.device == v_cache.device
+@@ -1014,6 +1074,7 @@ def qsa_sparse_paged_attention(
+         out,
+         softmax_scale,
+         output_scale,
++        lut,
+         output_gate_view,
+         q.stride(0),
+         q.stride(1),
+@@ -1079,9 +1140,11 @@ def warmup_qsa_sparse_paged_attention(
+     """Compile every production-reachable split-K/merge specialization."""
+     head_dim = kv_cache.shape[-1] // 2
+     key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
+-    # An fp8 cache is allocated as uint8 and viewed as e4m3 at attention time.
+-    is_fp8 = kv_cache.dtype == torch.uint8
+-    cache_dtype = torch.float8_e4m3fn if is_fp8 else key_cache.dtype
++    # An fp8 cache is allocated as uint8, and the kernels read it as uint8.
++    kv_cache, is_fp8 = _qsa_fp8_bytes(kv_cache)
++    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
++    cache_dtype = key_cache.dtype
++    lut_ptr = TritonWarmupTensor(torch.bfloat16, shape=(256,))
+     num_kv_heads = key_cache.shape[2]
+     group_size = num_query_heads // num_kv_heads
+     block_m = triton.next_power_of_2(group_size)
+@@ -1157,6 +1220,7 @@ def warmup_qsa_sparse_paged_attention(
+             output_ptr,
+             1.0,
+             1.0,
++            lut_ptr if is_fp8 else q_ptr,
+             output_gate_ptr,
+             row_stride,
+             head_stride,
+@@ -1519,6 +1583,9 @@ def _qsa_sparse_paged_gqa_cached_kernel(
+     partial_lse_ptr,
+     output_ptr,
+     output_gate_ptr,
++    softmax_scale,
++    output_scale,
++    lut_ptr,
+     region_ptr,
+     tag_ptr,
+     claim_ptr,
+@@ -1553,6 +1620,7 @@ def _qsa_sparse_paged_gqa_cached_kernel(
+     NUM_TILES: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
++    IS_FP8: tl.constexpr,
+ ) -> None:
+     """_qsa_sparse_paged_gqa_splitk_kernel with the row cache in front of K/V."""
+     row = tl.program_id(0)
+@@ -1578,7 +1646,7 @@ def _qsa_sparse_paged_gqa_cached_kernel(
+     max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
+     normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
+     accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+-    softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
++    score_scale = softmax_scale * 1.4426950408889634
+ 
+     tile_end = tl.minimum(NUM_TILES, tl.cdiv(tl.minimum(valid_count, TOPK), BLOCK_N))
+ 
+@@ -1643,8 +1711,13 @@ def _qsa_sparse_paged_gqa_cached_kernel(
+             mask=owner & (kv_head == 0),
+         )
+ 
++        # The row cache holds the stored bytes; dequantize after the stores.
++        if IS_FP8:
++            # E4M3 bytes -> BF16 through the table (exact); see _qsa_fp8_e4m3_lut.
++            keys = tl.load(lut_ptr + keys.to(tl.uint8, bitcast=True).to(tl.int32))
++            values = tl.load(lut_ptr + values.to(tl.uint8, bitcast=True).to(tl.int32))
+         scores = tl.dot(query, keys)
+-        scores *= softmax_scale_log2
++        scores *= score_scale
+         scores = tl.where(valid[None, :], scores, -1.0e20)
+         next_max = tl.maximum(max_value, tl.max(scores, axis=1))
+         alpha = tl.math.exp2(max_value - next_max)
+@@ -1662,7 +1735,7 @@ def _qsa_sparse_paged_gqa_cached_kernel(
+     has_values = normalizer > 0
+     normalized_output = tl.where(
+         has_values[:, None],
+-        accumulator / tl.maximum(normalizer[:, None], 1.0e-20),
++        accumulator * (output_scale / tl.maximum(normalizer[:, None], 1.0e-20)),
+         0.0,
+     )
+     output_mask = head_offsets[:, None] < GROUP_SIZE
+@@ -1806,6 +1879,8 @@ def qsa_sparse_paged_attention_cached(
+     layer_index: int,
+     *,
+     output_gate: torch.Tensor,
++    k_scale: float | None = None,
++    v_scale: float | None = None,
+ ) -> torch.Tensor:
+     """qsa_sparse_paged_attention through the row cache. Same contract.
+ 
+@@ -1816,10 +1891,15 @@ def qsa_sparse_paged_attention_cached(
+     output_gate_view = output_gate.view_as(q)
+     if not q.shape[0]:
+         return out
++    k_cache, is_fp8 = _qsa_fp8_bytes(k_cache)
++    v_cache, _ = _qsa_fp8_bytes(v_cache)
++    assert k_cache.dtype == v_cache.dtype == row_cache.rows.dtype
++    softmax_scale, output_scale = _qsa_scales(q.shape[2], is_fp8, k_scale, v_scale)
++    lut = _qsa_fp8_e4m3_lut(q.device) if is_fp8 else q
+     group_size = q.shape[1] // k_cache.shape[2]
+     selection_width = logical_indices.shape[1] - 1
+     block_n, partial_warps, num_tiles, num_splits = _select_config(
+-        q.shape[0], k_cache.shape[2], use_prefill_config, selection_width
++        q.shape[0], k_cache.shape[2], use_prefill_config, selection_width, is_fp8
+     )
+     tags = row_cache.tags[layer_index]
+     plan_block = QSARowCache._PLAN_BLOCK
+@@ -1868,6 +1948,9 @@ def qsa_sparse_paged_attention_cached(
+         partial_lse,
+         out,
+         output_gate_view,
++        softmax_scale,
++        output_scale,
++        lut,
+         row_cache.region(layer_index),
+         tags,
+         row_cache.claim,
+@@ -1902,6 +1985,7 @@ def qsa_sparse_paged_attention_cached(
+         NUM_TILES=num_tiles,
+         BLOCK_M=triton.next_power_of_2(group_size),
+         BLOCK_N=block_n,
++        IS_FP8=is_fp8,
+         num_warps=partial_warps,
+         num_stages=2,
+     )
+@@ -1930,6 +2014,7 @@ def qsa_sparse_paged_attention_cached(
+ __all__ = [
+     "QSARowCache",
+     "qsa_compress_groups_with_ratio",
++    "qsa_fp8_prepare",
+     "qsa_get_row_cache",
+     "qsa_sparse_paged_attention",
+     "qsa_sparse_paged_attention_cached",
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index e95ba6c..5911e7f 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -178,7 +178,11 @@ def _qsa_host_ram_available() -> int | None:
+ 
+ 
+ def _qsa_pin_host_pool(
+-    shape: tuple[int, ...], nbytes: int, layer_name: str, pool_layers: int
++    shape: tuple[int, ...],
++    nbytes: int,
++    layer_name: str,
++    pool_layers: int,
++    dtype: torch.dtype = torch.bfloat16,
+ ) -> tuple[torch.Tensor, object]:
+     """Allocate one layer's host K/V pool and pin exactly ``nbytes``.
+ 
+@@ -233,7 +237,7 @@ def _qsa_pin_host_pool(
+                 buf.madvise(mmap.MADV_HUGEPAGE)
+             except OSError:
+                 pass
+-        host = torch.frombuffer(buf, dtype=torch.bfloat16).view(shape)
++        host = torch.frombuffer(buf, dtype=dtype).view(shape)
+         err = torch.cuda.cudart().cudaHostRegister(host.data_ptr(), nbytes, 0)
+         if err.value != 0:
+             raise RuntimeError(
+@@ -307,6 +311,8 @@ def _qsa_staged_prefill(
+         use_prefill_config,
+         output[:num_tokens],
+         output_gate=output_gate[:num_tokens],
++        k_scale=layer._k_scale_float,
++        v_scale=layer._v_scale_float,
+     )
+     return start, end
+ 
+@@ -449,6 +455,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+                     row_cache,
+                     layer._qsa_row_cache_index,
+                     output_gate=output_gate[:num_tokens],
++                    k_scale=k_scale,
++                    v_scale=v_scale,
+                 )
+                 return output
+             qsa_sparse_paged_attention(
+@@ -719,10 +727,17 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+             dtype=self.kv_cache_torch_dtype,
+             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+             num_head_slots=1 if self._qsa_kv_offload else None,
+-            state_content_bytes=2 if self._qsa_kv_offload else None,
++            # The GPU slot is one cache element per token (see bind_kv_cache).
++            state_content_bytes=(
++                self.kv_cache_torch_dtype.itemsize if self._qsa_kv_offload else None
++            ),
+         )
+ 
+     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
++        if self.kv_cache_torch_dtype != torch.bfloat16:
++            from .ops.qsa import qsa_fp8_prepare
++
++            qsa_fp8_prepare(kv_cache.device)
+         if not self._qsa_kv_offload:
+             super().bind_kv_cache(kv_cache)
+             return
+@@ -737,10 +752,19 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+         num_blocks, _, block_size, _ = kv_cache.shape
+         shape = (num_blocks, self.num_kv_heads, block_size, 2 * self.head_dim)
+         layer_bytes = (
+-            num_blocks * self.num_kv_heads * block_size * 2 * self.head_dim * 2
++            num_blocks
++            * self.num_kv_heads
++            * block_size
++            * 2
++            * self.head_dim
++            * self.kv_cache_torch_dtype.itemsize
+         )
+         self._qsa_host_kv, self._qsa_host_buf = _qsa_pin_host_pool(
+-            shape, layer_bytes, self.layer_name, self._qsa_offload_layers
++            shape,
++            layer_bytes,
++            self.layer_name,
++            self._qsa_offload_layers,
++            dtype=self.kv_cache_torch_dtype,
+         )
+         self._qsa_gpu_slots = kv_cache
+         self.kv_cache = get_accelerator_view_from_cpu_tensor(self._qsa_host_kv)
+diff --git a/vllm/platforms/interface.py b/vllm/platforms/interface.py
+index 710ee61..af29a01 100644
+--- a/vllm/platforms/interface.py
++++ b/vllm/platforms/interface.py
+@@ -80,7 +80,9 @@ def _qsa_offload_bytes_per_token_per_layer(vllm_config: "VllmConfig") -> int:
+     if not head_dim or not ratio:
+         raise ValueError("QSA offload needs indexer_head_dim/indexer_compress_ratio")
+     dtype_size = vllm_config.model_config.dtype.itemsize
+-    return 2 + heads * (head_dim // ratio) * dtype_size
++    # The slot is one main-cache element: 1 byte for an FP8 KV cache.
++    slot = 1 if str(vllm_config.cache_config.cache_dtype).startswith("fp8") else 2
++    return slot + heads * (head_dim // ratio) * dtype_size
+ 
+ 
+ def _qsa_offload_block_size(vllm_config: "VllmConfig", mamba_page_size: int):
